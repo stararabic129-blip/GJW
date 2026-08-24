@@ -1,0 +1,214 @@
+name: K7-B1 Cloud Mirror
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - slug: pip
+            repo: pypa/pip
+            commit: 6d309205789d368b2749d93fd6193d584811efd5
+            tree: b1ac16314428dd6610c1c24b388f7eb90c5c6c67
+
+          - slug: pytest
+            repo: pytest-dev/pytest
+            commit: 060c851856f732d06cfd68feb35e7a332b1c32ad
+            tree: d9ca7e16826d049bed5b8fed843d94f5be01b0b2
+
+          - slug: django
+            repo: django/django
+            commit: 03988c5a5ba248c3b9b11ea96fd4fda5e98849aa
+            tree: 1afcf39f4d09f8b99b449903fa7822efb0dd162e
+
+    steps:
+      - name: Build exact repository mirror
+        shell: bash
+        env:
+          SLUG: ${{ matrix.slug }}
+          REPO: ${{ matrix.repo }}
+          PINNED_COMMIT: ${{ matrix.commit }}
+          EXPECTED_TREE: ${{ matrix.tree }}
+        run: |
+          set -euo pipefail
+
+          WORK="$RUNNER_TEMP/$SLUG"
+          OUT="$GITHUB_WORKSPACE/out/$SLUG"
+
+          mkdir -p "$WORK" "$OUT"
+          cd "$WORK"
+
+          git init -q
+          git remote add origin "https://github.com/$REPO.git"
+          git fetch --depth=1 --no-tags origin "$PINNED_COMMIT"
+
+          RESOLVED_COMMIT="$(git rev-parse FETCH_HEAD)"
+          RESOLVED_TREE="$(git rev-parse "${RESOLVED_COMMIT}^{tree}")"
+
+          echo "REPO=$REPO"
+          echo "PINNED_COMMIT=$PINNED_COMMIT"
+          echo "RESOLVED_COMMIT=$RESOLVED_COMMIT"
+          echo "EXPECTED_ROOT_TREE=$EXPECTED_TREE"
+          echo "RESOLVED_ROOT_TREE=$RESOLVED_TREE"
+
+          test "$RESOLVED_COMMIT" = "$PINNED_COMMIT"
+          echo "COMMIT_MATCH=PASS"
+
+          test "$RESOLVED_TREE" = "$EXPECTED_TREE"
+          echo "ROOT_TREE_MATCH=PASS"
+
+          PACKAGE="$OUT/${SLUG}_${PINNED_COMMIT}.tar"
+
+          git archive \
+            --format=tar \
+            --output="$PACKAGE" \
+            "$RESOLVED_COMMIT"
+
+          git ls-tree -r --name-only "$RESOLVED_COMMIT" > "$OUT/files.txt"
+
+          BYTES="$(stat -c%s "$PACKAGE")"
+          SHA256="$(sha256sum "$PACKAGE" | awk '{print $1}')"
+          TOTAL_FILES="$(wc -l < "$OUT/files.txt")"
+
+          export OUT PACKAGE BYTES SHA256 TOTAL_FILES
+          export RESOLVED_COMMIT RESOLVED_TREE
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          out = Path(os.environ["OUT"])
+
+          paths = [
+              x.strip()
+              for x in (out / "files.txt").read_text(
+                  encoding="utf-8",
+                  errors="replace"
+              ).splitlines()
+              if x.strip()
+          ]
+
+          def low(x):
+              return x.lower()
+
+          source = [p for p in paths if low(p).endswith((".py", ".pyi", ".pyx"))]
+
+          tests = [
+              p for p in paths
+              if "/tests/" in "/" + low(p) + "/"
+              or "/test/" in "/" + low(p) + "/"
+              or Path(p).name.lower().startswith("test_")
+          ]
+
+          docs = [
+              p for p in paths
+              if "/docs/" in "/" + low(p) + "/"
+              or low(p).endswith((".md", ".rst"))
+          ]
+
+          ci = [
+              p for p in paths
+              if "/.github/workflows/" in "/" + low(p) + "/"
+          ]
+
+          packaging = [
+              p for p in paths
+              if Path(p).name.lower() in {
+                  "pyproject.toml",
+                  "setup.py",
+                  "setup.cfg",
+                  "manifest.in",
+                  "requirements.txt",
+                  "uv.lock",
+              }
+          ]
+
+          config = [
+              p for p in paths
+              if low(p).endswith(
+                  (".toml", ".ini", ".cfg", ".yaml", ".yml", ".json")
+              )
+          ]
+
+          manifest = {
+              "schema_version": "GJ_K7_B1_PHYSICAL_MIRROR_V1",
+              "repository": os.environ["REPO"],
+              "pinned_commit": os.environ["PINNED_COMMIT"],
+              "resolved_commit": os.environ["RESOLVED_COMMIT"],
+              "expected_root_tree": os.environ["EXPECTED_TREE"],
+              "resolved_root_tree": os.environ["RESOLVED_TREE"],
+              "identity_verification": "PASS",
+              "package_filename": Path(os.environ["PACKAGE"]).name,
+              "package_format": "tar",
+              "physical_bytes": int(os.environ["BYTES"]),
+              "canonical_sha256": os.environ["SHA256"],
+              "file_inventory": {
+                  "TOTAL_FILES": len(paths),
+                  "SOURCE_FILES": len(set(source)),
+                  "TEST_FILES": len(set(tests)),
+                  "DOC_FILES": len(set(docs)),
+                  "CI_WORKFLOW_FILES": len(set(ci)),
+                  "PACKAGING_FILES": len(set(packaging)),
+                  "CONFIG_FILES": len(set(config)),
+              },
+              "TRAINING_ALLOWED":
+                  "NO_BLOCKED_PENDING_SEPARATE_POLICY_REVIEW",
+              "COMMERCIAL_TRAINING_ALLOWED":
+                  "NO_BLOCKED_PENDING_SEPARATE_POLICY_REVIEW",
+              "training_performed": False,
+              "model_weights_modified": False,
+              "user_pc_bytes_used": 0,
+              "capture_time_utc":
+                  datetime.now(timezone.utc).isoformat(),
+              "github_actions_run_id":
+                  os.environ.get("GITHUB_RUN_ID"),
+              "temporary_retention_days": 7
+          }
+
+          (out / "manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True),
+              encoding="utf-8"
+          )
+          PY
+
+          (
+            cd "$OUT"
+            sha256sum \
+              "$(basename "$PACKAGE")" \
+              manifest.json \
+              > checksums.sha256
+          )
+
+          MANIFEST_SHA256="$(sha256sum "$OUT/manifest.json" | awk '{print $1}')"
+
+          echo "PHYSICAL_SOURCE_BYTES_ACQUIRED=YES"
+          echo "PHYSICAL_BYTES=$BYTES"
+          echo "CANONICAL_SHA256=$SHA256"
+          echo "TOTAL_FILES=$TOTAL_FILES"
+          echo "MANIFEST_SHA256=$MANIFEST_SHA256"
+          echo "USER_PC_BYTES_USED=0"
+          echo "PHYSICAL_MIRROR_BUILD_STATUS=PASS"
+
+          rm "$OUT/files.txt"
+
+      - name: Upload cloud artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: K7-B1-${{ matrix.slug }}-${{ matrix.commit }}
+          path: out/${{ matrix.slug }}/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
