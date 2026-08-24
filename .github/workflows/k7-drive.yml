@@ -1,0 +1,413 @@
+name: K7-B1 Drive Transfer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: k7-b1-drive-transfer
+  cancel-in-progress: false
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+      SOURCE_RUN_ID: "32698373400"
+
+      GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+      GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+      GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+
+      PIP_FOLDER_ID: "1xY5G7J8lLBtdZxYhyRIijVWZlYhyy0Az"
+      PYTEST_FOLDER_ID: "1Sw--BU-W2OrUEVw7zxSzxflfXxjm5lHa"
+      DJANGO_FOLDER_ID: "1UVj2-niTEd0frVUxZIViUVSM1z99BZq8"
+
+    steps:
+      - name: Verify source run
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          STATUS="$(gh run view "$SOURCE_RUN_ID" --json status --jq '.status')"
+          CONCLUSION="$(gh run view "$SOURCE_RUN_ID" --json conclusion --jq '.conclusion')"
+
+          echo "SOURCE_RUN_ID=$SOURCE_RUN_ID"
+          echo "SOURCE_RUN_STATUS=$STATUS"
+          echo "SOURCE_RUN_CONCLUSION=$CONCLUSION"
+
+          test "$STATUS" = "completed"
+          test "$CONCLUSION" = "success"
+
+          echo "SOURCE_RUN_VERIFICATION=PASS"
+
+      - name: Download existing GitHub artifacts cloud-side
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p artifacts/pip artifacts/pytest artifacts/django
+
+          gh run download "$SOURCE_RUN_ID" \
+            -n "K7-B1-pip-6d309205789d368b2749d93fd6193d584811efd5" \
+            -D artifacts/pip
+
+          gh run download "$SOURCE_RUN_ID" \
+            -n "K7-B1-pytest-060c851856f732d06cfd68feb35e7a332b1c32ad" \
+            -D artifacts/pytest
+
+          gh run download "$SOURCE_RUN_ID" \
+            -n "K7-B1-django-03988c5a5ba248c3b9b11ea96fd4fda5e98849aa" \
+            -D artifacts/django
+
+          echo "ARTIFACT_DOWNLOADS=PASS"
+          echo "USER_PC_BYTES_USED=0"
+
+      - name: Verify canonical artifacts and manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          expected = {
+              "pip": {
+                  "repo": "pypa/pip",
+                  "commit": "6d309205789d368b2749d93fd6193d584811efd5",
+                  "tree": "b1ac16314428dd6610c1c24b388f7eb90c5c6c67",
+              },
+              "pytest": {
+                  "repo": "pytest-dev/pytest",
+                  "commit": "060c851856f732d06cfd68feb35e7a332b1c32ad",
+                  "tree": "d9ca7e16826d049bed5b8fed843d94f5be01b0b2",
+              },
+              "django": {
+                  "repo": "django/django",
+                  "commit": "03988c5a5ba248c3b9b11ea96fd4fda5e98849aa",
+                  "tree": "1afcf39f4d09f8b99b449903fa7822efb0dd162e",
+              },
+          }
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          for slug, exp in expected.items():
+              root = Path("artifacts") / slug
+
+              manifest_path = root / "manifest.json"
+              checksums_path = root / "checksums.sha256"
+              tar_files = list(root.glob("*.tar"))
+
+              assert manifest_path.is_file(), f"{slug}: missing manifest.json"
+              assert checksums_path.is_file(), f"{slug}: missing checksums.sha256"
+              assert len(tar_files) == 1, f"{slug}: expected exactly one TAR"
+
+              tar_path = tar_files[0]
+
+              manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+              assert manifest["schema_version"] == "GJ_K7_B1_PHYSICAL_MIRROR_V1"
+              assert manifest["repository"] == exp["repo"]
+              assert manifest["pinned_commit"] == exp["commit"]
+              assert manifest["resolved_commit"] == exp["commit"]
+              assert manifest["expected_root_tree"] == exp["tree"]
+              assert manifest["resolved_root_tree"] == exp["tree"]
+              assert manifest["identity_verification"] == "PASS"
+
+              assert manifest["training_performed"] is False
+              assert manifest["model_weights_modified"] is False
+              assert manifest["user_pc_bytes_used"] == 0
+
+              assert manifest["package_filename"] == tar_path.name
+              assert manifest["physical_bytes"] == tar_path.stat().st_size
+
+              tar_sha = sha256(tar_path)
+              assert manifest["canonical_sha256"] == tar_sha
+
+              checksum_entries = {}
+              for line in checksums_path.read_text(encoding="utf-8").splitlines():
+                  digest, filename = line.split(None, 1)
+                  checksum_entries[filename.strip()] = digest
+
+              assert checksum_entries[tar_path.name] == tar_sha
+              assert checksum_entries["manifest.json"] == sha256(manifest_path)
+
+              print(f"{slug.upper()}_CANONICAL_BYTES={tar_path.stat().st_size}")
+              print(f"{slug.upper()}_CANONICAL_SHA256={tar_sha}")
+              print(f"{slug.upper()}_MANIFEST_SHA256={sha256(manifest_path)}")
+              print(f"{slug.upper()}_ARTIFACT_VERIFICATION=PASS")
+
+          print("ALL_CANONICAL_ARTIFACTS_VERIFIED=PASS")
+          print("USER_PC_BYTES_USED=0")
+          PY
+
+      - name: Install transfer dependency
+        shell: bash
+        run: |
+          python3 -m pip install --quiet requests
+
+      - name: Upload to Google Drive and exact readback verify
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          import requests
+
+          TOKEN_URL = "https://oauth2.googleapis.com/token"
+          DRIVE_API = "https://www.googleapis.com/drive/v3"
+          DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3/files"
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          token_response = requests.post(
+              TOKEN_URL,
+              data={
+                  "client_id": os.environ["GDRIVE_CLIENT_ID"],
+                  "client_secret": os.environ["GDRIVE_CLIENT_SECRET"],
+                  "refresh_token": os.environ["GDRIVE_REFRESH_TOKEN"],
+                  "grant_type": "refresh_token",
+              },
+              timeout=30,
+          )
+          token_response.raise_for_status()
+          access_token = token_response.json()["access_token"]
+
+          auth_headers = {
+              "Authorization": f"Bearer {access_token}",
+          }
+
+          folder_ids = {
+              "pip": os.environ["PIP_FOLDER_ID"],
+              "pytest": os.environ["PYTEST_FOLDER_ID"],
+              "django": os.environ["DJANGO_FOLDER_ID"],
+          }
+
+          def remote_hash_and_size(file_id: str):
+              response = requests.get(
+                  f"{DRIVE_API}/files/{file_id}",
+                  params={"alt": "media"},
+                  headers=auth_headers,
+                  stream=True,
+                  timeout=300,
+              )
+              response.raise_for_status()
+
+              h = hashlib.sha256()
+              total = 0
+
+              for chunk in response.iter_content(chunk_size=1024 * 1024):
+                  if chunk:
+                      total += len(chunk)
+                      h.update(chunk)
+
+              return total, h.hexdigest()
+
+          def find_existing(folder_id: str, name: str):
+              safe_name = name.replace("'", "\\'")
+              response = requests.get(
+                  f"{DRIVE_API}/files",
+                  headers=auth_headers,
+                  params={
+                      "q": (
+                          f"'{folder_id}' in parents and "
+                          f"name = '{safe_name}' and trashed = false"
+                      ),
+                      "fields": "files(id,name,size,parents)",
+                      "pageSize": 10,
+                  },
+                  timeout=30,
+              )
+              response.raise_for_status()
+              return response.json().get("files", [])
+
+          def upload_resumable(path: Path, folder_id: str):
+              local_size = path.stat().st_size
+              local_sha = sha256(path)
+
+              existing = find_existing(folder_id, path.name)
+
+              if len(existing) > 1:
+                  raise RuntimeError(
+                      f"Multiple Drive objects already exist for {path.name}"
+                  )
+
+              if len(existing) == 1:
+                  file_id = existing[0]["id"]
+                  remote_size, remote_sha = remote_hash_and_size(file_id)
+
+                  if remote_size != local_size or remote_sha != local_sha:
+                      raise RuntimeError(
+                          f"Existing Drive object mismatch for {path.name}"
+                      )
+
+                  return {
+                      "id": file_id,
+                      "size": remote_size,
+                      "sha256": remote_sha,
+                      "status": "REUSED_VERIFIED",
+                  }
+
+              init_headers = {
+                  **auth_headers,
+                  "Content-Type": "application/json; charset=UTF-8",
+                  "X-Upload-Content-Type": "application/octet-stream",
+                  "X-Upload-Content-Length": str(local_size),
+              }
+
+              init_response = requests.post(
+                  DRIVE_UPLOAD,
+                  params={
+                      "uploadType": "resumable",
+                      "fields": "id,name,size,parents",
+                  },
+                  headers=init_headers,
+                  json={
+                      "name": path.name,
+                      "parents": [folder_id],
+                  },
+                  timeout=30,
+              )
+              init_response.raise_for_status()
+
+              upload_url = init_response.headers["Location"]
+
+              with path.open("rb") as f:
+                  upload_response = requests.put(
+                      upload_url,
+                      headers={
+                          "Content-Type": "application/octet-stream",
+                          "Content-Length": str(local_size),
+                      },
+                      data=f,
+                      timeout=600,
+                  )
+
+              upload_response.raise_for_status()
+              file_id = upload_response.json()["id"]
+
+              metadata_response = requests.get(
+                  f"{DRIVE_API}/files/{file_id}",
+                  headers=auth_headers,
+                  params={"fields": "id,name,size,parents"},
+                  timeout=30,
+              )
+              metadata_response.raise_for_status()
+              metadata = metadata_response.json()
+
+              if int(metadata["size"]) != local_size:
+                  raise RuntimeError(
+                      f"Drive metadata byte mismatch for {path.name}"
+                  )
+
+              if folder_id not in metadata.get("parents", []):
+                  raise RuntimeError(
+                      f"Drive parent mismatch for {path.name}"
+                  )
+
+              remote_size, remote_sha = remote_hash_and_size(file_id)
+
+              if remote_size != local_size:
+                  raise RuntimeError(
+                      f"Drive readback byte mismatch for {path.name}"
+                  )
+
+              if remote_sha != local_sha:
+                  raise RuntimeError(
+                      f"Drive readback SHA256 mismatch for {path.name}"
+                  )
+
+              return {
+                  "id": file_id,
+                  "size": remote_size,
+                  "sha256": remote_sha,
+                  "status": "UPLOADED_VERIFIED",
+              }
+
+          final = {}
+
+          for slug in ("pip", "pytest", "django"):
+              root = Path("artifacts") / slug
+              tar_files = list(root.glob("*.tar"))
+
+              if len(tar_files) != 1:
+                  raise RuntimeError(f"{slug}: expected exactly one TAR")
+
+              files = [
+                  tar_files[0],
+                  root / "manifest.json",
+                  root / "checksums.sha256",
+              ]
+
+              repo_result = {}
+
+              for path in files:
+                  if not path.is_file():
+                      raise RuntimeError(f"Missing required file: {path}")
+
+                  result = upload_resumable(path, folder_ids[slug])
+                  repo_result[path.name] = result
+
+                  print(
+                      f"{slug.upper()}_DRIVE_FILE="
+                      f"{path.name}|"
+                      f"ID={result['id']}|"
+                      f"BYTES={result['size']}|"
+                      f"SHA256={result['sha256']}|"
+                      f"STATUS={result['status']}"
+                  )
+
+              final[slug] = repo_result
+              print(f"{slug.upper()}_PHYSICAL_MIRROR_IN_DRIVE=YES")
+              print(f"{slug.upper()}_EXACT_READBACK=PASS")
+
+          print("USER_PC_BYTES_USED=0")
+          print("TRAINING_PERFORMED=NO")
+          print("MODEL_WEIGHTS_MODIFIED=NO")
+          print("K7_B2_STARTED=NO")
+          print("TEMP_DELETE_ALLOWED=YES")
+          print("K7_B1_DRIVE_TRANSFER_STATUS=PASS")
+          PY
+
+      - name: Final qualification
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "GITHUB_SOURCE_RUN=32698373400"
+          echo "GITHUB_SOURCE_RUN_VERIFIED=PASS"
+          echo "PIP_PHYSICAL_MIRROR_IN_DRIVE=YES"
+          echo "PIP_EXACT_READBACK=PASS"
+          echo "PYTEST_PHYSICAL_MIRROR_IN_DRIVE=YES"
+          echo "PYTEST_EXACT_READBACK=PASS"
+          echo "DJANGO_PHYSICAL_MIRROR_IN_DRIVE=YES"
+          echo "DJANGO_EXACT_READBACK=PASS"
+          echo "USER_PC_BYTES_USED=0"
+          echo "TRAINING_PERFORMED=NO"
+          echo "MODEL_WEIGHTS_MODIFIED=NO"
+          echo "K7_B2_STARTED=NO"
+          echo "TEMP_DELETE_ALLOWED=YES"
+          echo "K7_B1_PHYSICAL_MIRROR_CLOSURE=PASS"
