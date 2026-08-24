@@ -1,0 +1,678 @@
+name: K7-B2 FastAPI Immutable Mirror
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: "Upstream owner/repo"
+        required: false
+        default: "fastapi/fastapi"
+        type: string
+      upstream_branch:
+        description: "Branch to observe once, then freeze to the resolved full SHA"
+        required: false
+        default: "master"
+        type: string
+      drive_parent_folder_id:
+        description: "Existing Drive folder that will contain the immutable commit folder"
+        required: false
+        default: "1-0eyQcYydvZgifwwGgbAQ1Yx_aiRsbwY"
+        type: string
+  push:
+    paths:
+      - ".github/workflows/k7-b2-fastapi.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: k7-b2-fastapi-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: ${{ inputs.upstream_repo || 'fastapi/fastapi' }}
+  UPSTREAM_BRANCH: ${{ inputs.upstream_branch || 'master' }}
+  DRIVE_PARENT_FOLDER_ID: ${{ inputs.drive_parent_folder_id || '1-0eyQcYydvZgifwwGgbAQ1Yx_aiRsbwY' }}
+  ARTIFACT_RETENTION_DAYS: "7"
+  USER_PC_BYTES_USED: "0"
+  TRAINING_PERFORMED: "NO"
+  MODEL_WEIGHTS_MODIFIED: "NO"
+
+jobs:
+  mirror-fastapi:
+    name: Freeze, mirror, hash, upload, read back
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Guard source selection
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$UPSTREAM_REPO" = "fastapi/fastapi"
+          test "$UPSTREAM_BRANCH" = "master"
+          test -n "$DRIVE_PARENT_FOLDER_ID"
+          echo "SOURCE=$UPSTREAM_REPO"
+          echo "BRANCH_OBSERVED=$UPSTREAM_BRANCH"
+          echo "USER_PC_BYTES_USED=$USER_PC_BYTES_USED"
+          echo "TRAINING_PERFORMED=$TRAINING_PERFORMED"
+          echo "MODEL_WEIGHTS_MODIFIED=$MODEL_WEIGHTS_MODIFIED"
+
+      - name: Resolve branch once and freeze full immutable SHA
+        id: freeze
+        shell: bash
+        run: |
+          set -euo pipefail
+          upstream_url="https://github.com/${UPSTREAM_REPO}.git"
+          ref="refs/heads/${UPSTREAM_BRANCH}"
+          full_sha="$(git ls-remote --refs "$upstream_url" "$ref" | awk 'NR==1 {print $1}')"
+
+          if [[ ! "$full_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "PIN_RESOLUTION=FAIL"
+            echo "Resolved value: ${full_sha:-<empty>}"
+            exit 1
+          fi
+
+          capture_utc="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          {
+            echo "FROZEN_COMMIT=$full_sha"
+            echo "CAPTURE_UTC=$capture_utc"
+            echo "UPSTREAM_URL=$upstream_url"
+          } >> "$GITHUB_ENV"
+
+          {
+            echo "full_sha=$full_sha"
+            echo "capture_utc=$capture_utc"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "PIN_RESOLUTION=PASS"
+          echo "BRANCH_OBSERVED=$UPSTREAM_BRANCH"
+          echo "FULL_RESOLVED_COMMIT=$full_sha"
+          echo "CAPTURE_UTC=$capture_utc"
+
+      - name: Fetch exactly the frozen commit and verify identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/k7-b2-fastapi"
+          repo_dir="$work/repo"
+          out_dir="$work/out"
+          scratch_dir="$work/scratch"
+          rm -rf "$work"
+          mkdir -p "$repo_dir" "$out_dir" "$scratch_dir"
+
+          git -C "$repo_dir" init -q
+          git -C "$repo_dir" remote add origin "$UPSTREAM_URL"
+          git -C "$repo_dir" fetch --depth=1 --no-tags origin "$FROZEN_COMMIT"
+
+          fetched_commit="$(git -C "$repo_dir" rev-parse FETCH_HEAD)"
+          resolved_commit="$(git -C "$repo_dir" rev-parse "$FROZEN_COMMIT^{commit}")"
+          root_tree="$(git -C "$repo_dir" rev-parse "$FROZEN_COMMIT^{tree}")"
+
+          [[ "$fetched_commit" == "$FROZEN_COMMIT" ]]
+          [[ "$resolved_commit" == "$FROZEN_COMMIT" ]]
+          [[ "$root_tree" =~ ^[0-9a-f]{40}$ ]]
+
+          gitlink_count="$(git -C "$repo_dir" ls-tree -r "$FROZEN_COMMIT" | awk '$2=="commit"{n++} END{print n+0}')"
+          if [[ "$gitlink_count" != "0" ]]; then
+            echo "SUBMODULE_GITLINKS=$gitlink_count"
+            echo "PHYSICAL_MIRROR_BUILD_STATUS=FAIL"
+            echo "Reason: git archive does not contain external submodule bytes; fail closed."
+            exit 1
+          fi
+
+          {
+            echo "WORK_DIR=$work"
+            echo "REPO_DIR=$repo_dir"
+            echo "OUT_DIR=$out_dir"
+            echo "SCRATCH_DIR=$scratch_dir"
+            echo "FETCHED_COMMIT=$fetched_commit"
+            echo "RESOLVED_COMMIT=$resolved_commit"
+            echo "ROOT_TREE=$root_tree"
+            echo "GITLINK_COUNT=$gitlink_count"
+          } >> "$GITHUB_ENV"
+
+          echo "RESOLVED_COMMIT=$resolved_commit"
+          echo "FETCHED_COMMIT=$fetched_commit"
+          echo "ROOT_TREE=$root_tree"
+          echo "RESOLVED_COMMIT_MATCH=PASS"
+          echo "ROOT_TREE_NONEMPTY=PASS"
+          echo "SUBMODULE_GITLINKS=$gitlink_count"
+
+      - name: Create canonical TAR and exact inventory
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="fastapi-${FROZEN_COMMIT}.tar"
+
+          git -C "$REPO_DIR" archive \
+            --format=tar \
+            --prefix="fastapi-${FROZEN_COMMIT}/" \
+            --output="$OUT_DIR/$package" \
+            "$FROZEN_COMMIT"
+
+          physical_bytes="$(stat -c '%s' "$OUT_DIR/$package")"
+          canonical_sha256="$(sha256sum "$OUT_DIR/$package" | awk '{print $1}')"
+
+          [[ "$physical_bytes" =~ ^[1-9][0-9]*$ ]]
+          [[ "$canonical_sha256" =~ ^[0-9a-f]{64}$ ]]
+
+          git -C "$REPO_DIR" ls-tree -r -z "$FROZEN_COMMIT" > "$SCRATCH_DIR/tree.z"
+
+          PACKAGE="$package" \
+          PHYSICAL_BYTES="$physical_bytes" \
+          CANONICAL_SHA256="$canonical_sha256" \
+          python3 - <<'PY'
+          import json
+          import os
+          import tarfile
+          from pathlib import PurePosixPath
+
+          data = open(os.path.join(os.environ["SCRATCH_DIR"], "tree.z"), "rb").read().split(b"\0")
+          entries = []
+          for raw in data:
+              if not raw:
+                  continue
+              meta, path_b = raw.split(b"\t", 1)
+              mode, typ, sha = meta.decode("ascii").split(" ", 2)
+              path = path_b.decode("utf-8", "surrogateescape")
+              entries.append((mode, typ, sha, path))
+
+          paths = [p for _, typ, _, p in entries if typ == "blob"]
+
+          prefix = f"fastapi-{os.environ['FROZEN_COMMIT']}/"
+          package_path = os.path.join(os.environ["OUT_DIR"], os.environ["PACKAGE"])
+          with tarfile.open(package_path, "r:") as tf:
+              archive_paths = []
+              for member in tf.getmembers():
+                  name = member.name
+                  parts = PurePosixPath(name).parts
+                  if name.startswith("/") or ".." in parts:
+                      raise SystemExit(f"ARCHIVE_PATH_SAFETY=FAIL member={name!r}")
+                  if member.isdir():
+                      continue
+                  if not name.startswith(prefix):
+                      raise SystemExit(f"ARCHIVE_PREFIX=FAIL member={name!r}")
+                  archive_paths.append(name[len(prefix):])
+
+          if sorted(archive_paths) != sorted(paths):
+              missing = sorted(set(paths) - set(archive_paths))[:20]
+              extra = sorted(set(archive_paths) - set(paths))[:20]
+              raise SystemExit(
+                  "ARCHIVE_TREE_PATH_MATCH=FAIL "
+                  f"expected={len(paths)} archived={len(archive_paths)} "
+                  f"missing_sample={missing} extra_sample={extra}"
+              )
+
+          source_exts = {
+              ".py", ".pyi", ".pyx", ".pxd", ".pxi",
+              ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".rs"
+          }
+          doc_exts = {".md", ".rst", ".adoc"}
+          config_exts = {".toml", ".ini", ".cfg", ".yaml", ".yml", ".json"}
+
+          def is_source(p):
+              return PurePosixPath(p).suffix.lower() in source_exts
+
+          def is_test(p):
+              q = p.lower()
+              name = PurePosixPath(q).name
+              return (
+                  q.startswith("tests/") or "/tests/" in q or
+                  q.startswith("test/") or "/test/" in q or
+                  name.startswith("test_") or name.endswith("_test.py")
+              )
+
+          def is_doc(p):
+              q = p.lower()
+              return (
+                  q.startswith("docs/") or "/docs/" in q or
+                  q.startswith("doc/") or "/doc/" in q or
+                  PurePosixPath(q).suffix.lower() in doc_exts
+              )
+
+          def is_ci(p):
+              return p.lower().startswith(".github/workflows/")
+
+          def is_packaging(p):
+              q = p.lower()
+              n = PurePosixPath(q).name
+              return (
+                  n in {
+                      "pyproject.toml", "setup.py", "setup.cfg", "manifest.in",
+                      "pdm.lock", "poetry.lock", "uv.lock", "pipfile", "pipfile.lock"
+                  } or
+                  n.startswith("requirements") or
+                  q.startswith("requirements/")
+              )
+
+          def is_config(p):
+              q = p.lower()
+              n = PurePosixPath(q).name
+              return (
+                  PurePosixPath(q).suffix.lower() in config_exts or
+                  n.startswith(".pre-commit") or
+                  n.startswith(".editorconfig") or
+                  n.startswith("tox.") or
+                  n.startswith("ruff.")
+              )
+
+          funcs = {
+              "SOURCE_FILES": is_source,
+              "TEST_FILES": is_test,
+              "DOC_FILES": is_doc,
+              "CI_WORKFLOW_FILES": is_ci,
+              "PACKAGING_FILES": is_packaging,
+              "CONFIG_FILES": is_config,
+          }
+          categories = {key: sum(1 for p in paths if fn(p)) for key, fn in funcs.items()}
+          classified = {p for p in paths if any(fn(p) for fn in funcs.values())}
+
+          vendor_parts = {"vendor", "vendors", "vendored", "third_party", "third-party", "external", "extern"}
+          vendored = []
+          secondary_licenses = []
+          generated = []
+
+          for p in paths:
+              parts = [x.lower() for x in PurePosixPath(p).parts]
+              name = PurePosixPath(p).name.lower()
+              if any(part in vendor_parts for part in parts):
+                  vendored.append(p)
+              if name.startswith(("license", "licence", "copying", "notice")) and "/" in p:
+                  secondary_licenses.append(p)
+              if any(token in parts for token in ("generated", "autogenerated", "autogen")):
+                  generated.append(p)
+
+          inventory = {
+              "TOTAL_FILES": len(paths),
+              **categories,
+              "OTHER_FILES": len(set(paths) - classified),
+              "GITLINKS": sum(1 for _, typ, _, _ in entries if typ == "commit"),
+              "ARCHIVE_TREE_PATH_MATCH": "PASS",
+              "ARCHIVE_PATH_SAFETY": "PASS",
+              "classification_note": "Categories may overlap; OTHER_FILES means no listed category matched.",
+          }
+
+          component_scan = {
+              "vendored_path_candidates": sorted(vendored),
+              "secondary_license_file_candidates": sorted(secondary_licenses),
+              "generated_path_candidates": sorted(generated),
+              "gitmodules_present": ".gitmodules" in paths,
+              "review_required": bool(vendored or secondary_licenses or ".gitmodules" in paths),
+          }
+
+          with open(os.path.join(os.environ["SCRATCH_DIR"], "inventory.json"), "w", encoding="utf-8") as f:
+              json.dump(inventory, f, indent=2, sort_keys=True)
+              f.write("\n")
+          with open(os.path.join(os.environ["SCRATCH_DIR"], "component-scan.json"), "w", encoding="utf-8") as f:
+              json.dump(component_scan, f, indent=2, sort_keys=True)
+              f.write("\n")
+          PY
+
+          {
+            echo "PACKAGE_FILENAME=$package"
+            echo "PHYSICAL_BYTES=$physical_bytes"
+            echo "CANONICAL_SHA256=$canonical_sha256"
+          } >> "$GITHUB_ENV"
+
+          echo "PACKAGE_FORMAT=tar"
+          echo "PACKAGE_FILENAME=$package"
+          echo "PHYSICAL_BYTES=$physical_bytes"
+          echo "CANONICAL_SHA256=$canonical_sha256"
+          python3 - <<'PY'
+          import json, os
+          inv = json.load(open(os.path.join(os.environ["SCRATCH_DIR"], "inventory.json"), encoding="utf-8"))
+          for k in ("TOTAL_FILES","SOURCE_FILES","TEST_FILES","DOC_FILES","CI_WORKFLOW_FILES","PACKAGING_FILES","CONFIG_FILES","OTHER_FILES","GITLINKS"):
+              print(f"{k}={inv[k]}")
+          print("ARCHIVE_TREE_PATH_MATCH=PASS")
+          print("ARCHIVE_PATH_SAFETY=PASS")
+          PY
+
+      - name: Build canonical manifest and checksums
+        id: manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          license_blob_sha="$(git -C "$REPO_DIR" rev-parse "$FROZEN_COMMIT:LICENSE")"
+          git -C "$REPO_DIR" show "$FROZEN_COMMIT:LICENSE" > "$SCRATCH_DIR/root-LICENSE"
+          license_sha256="$(sha256sum "$SCRATCH_DIR/root-LICENSE" | awk '{print $1}')"
+          export LICENSE_BLOB_SHA="$license_blob_sha"
+          export LICENSE_SHA256="$license_sha256"
+
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          out = os.environ["OUT_DIR"]
+          scratch = os.environ["SCRATCH_DIR"]
+          inventory = json.load(open(os.path.join(scratch, "inventory.json"), encoding="utf-8"))
+          component_scan = json.load(open(os.path.join(scratch, "component-scan.json"), encoding="utf-8"))
+
+          manifest = {
+              "schema_version": "GJ_K7_B2_PHYSICAL_MIRROR_V1",
+              "repository": os.environ["UPSTREAM_REPO"],
+              "upstream_url": os.environ["UPSTREAM_URL"],
+              "branch_observed": os.environ["UPSTREAM_BRANCH"],
+              "full_resolved_commit": os.environ["FROZEN_COMMIT"],
+              "fetched_commit": os.environ["FETCHED_COMMIT"],
+              "resolved_commit": os.environ["RESOLVED_COMMIT"],
+              "root_tree": os.environ["ROOT_TREE"],
+              "identity_verification": {
+                  "resolved_commit_equals_frozen_commit": os.environ["RESOLVED_COMMIT"] == os.environ["FROZEN_COMMIT"],
+                  "fetched_commit_equals_frozen_commit": os.environ["FETCHED_COMMIT"] == os.environ["FROZEN_COMMIT"],
+                  "root_tree_literal_nonempty": len(os.environ["ROOT_TREE"]) == 40,
+              },
+              "capture_time_utc": os.environ["CAPTURE_UTC"],
+              "acquisition_method": "git ls-remote branch observation -> freeze full SHA -> git fetch exact frozen SHA",
+              "package_filename": os.environ["PACKAGE_FILENAME"],
+              "package_format": "tar",
+              "physical_bytes": int(os.environ["PHYSICAL_BYTES"]),
+              "canonical_sha256": os.environ["CANONICAL_SHA256"],
+              "file_inventory": inventory,
+              "license": {
+                  "root_license": "MIT",
+                  "root_license_path": "LICENSE",
+                  "root_license_blob_sha": os.environ["LICENSE_BLOB_SHA"],
+                  "root_license_sha256": os.environ["LICENSE_SHA256"],
+              },
+              "component_license_scan": component_scan,
+              "rights": {
+                  "REFERENCE_ALLOWED": "YES_WITH_NOTICE",
+                  "RETRIEVAL_ALLOWED": (
+                      "BLOCKED_PENDING_COMPONENT_REVIEW"
+                      if component_scan["review_required"]
+                      else "YES_SELECTED_VERIFIED_PROJECT_MATERIAL"
+                  ),
+                  "TRAINING_ALLOWED": "NO",
+                  "COMMERCIAL_TRAINING_ALLOWED": "NO",
+              },
+              "provenance": {
+                  "worker_repository": os.environ["GITHUB_REPOSITORY"],
+                  "workflow": os.environ["GITHUB_WORKFLOW"],
+                  "workflow_ref": os.environ["GITHUB_WORKFLOW_REF"],
+                  "run_id": os.environ["GITHUB_RUN_ID"],
+                  "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+                  "run_number": os.environ["GITHUB_RUN_NUMBER"],
+                  "runner_os": os.environ["RUNNER_OS"],
+                  "runner_arch": os.environ["RUNNER_ARCH"],
+                  "git_version": subprocess.check_output(["git", "--version"], text=True).strip(),
+              },
+              "drive_destination_parent_folder_id": os.environ["DRIVE_PARENT_FOLDER_ID"],
+              "user_pc_bytes_used": 0,
+              "training_performed": False,
+              "model_weights_modified": False,
+          }
+
+          if not all(manifest["identity_verification"].values()):
+              raise SystemExit("identity verification was not fully true")
+
+          with open(os.path.join(out, "manifest.json"), "w", encoding="utf-8") as f:
+              json.dump(manifest, f, indent=2, sort_keys=True)
+              f.write("\n")
+          PY
+
+          manifest_sha256="$(sha256sum "$OUT_DIR/manifest.json" | awk '{print $1}')"
+          manifest_bytes="$(stat -c '%s' "$OUT_DIR/manifest.json")"
+
+          (
+            cd "$OUT_DIR"
+            sha256sum "$PACKAGE_FILENAME" manifest.json > checksums.sha256
+          )
+
+          {
+            echo "MANIFEST_SHA256=$manifest_sha256"
+            echo "MANIFEST_BYTES=$manifest_bytes"
+          } >> "$GITHUB_ENV"
+
+          echo "MANIFEST_SHA256=$manifest_sha256"
+          echo "MANIFEST_BYTES=$manifest_bytes"
+          echo "REFERENCE_ALLOWED=YES_WITH_NOTICE"
+          python3 - <<'PY'
+          import json, os
+          m = json.load(open(os.path.join(os.environ["OUT_DIR"], "manifest.json"), encoding="utf-8"))
+          print("RETRIEVAL_ALLOWED=" + m["rights"]["RETRIEVAL_ALLOWED"])
+          print("TRAINING_ALLOWED=NO")
+          print("COMMERCIAL_TRAINING_ALLOWED=NO")
+          print("COMPONENT_LICENSE_REVIEW_REQUIRED=" + ("YES" if m["component_license_scan"]["review_required"] else "NO"))
+          PY
+
+      - name: Verify manifest/checksum consistency
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$OUT_DIR"
+          sha256sum -c checksums.sha256
+          [[ "$(stat -c '%s' "$PACKAGE_FILENAME")" == "$PHYSICAL_BYTES" ]]
+          [[ "$(sha256sum "$PACKAGE_FILENAME" | awk '{print $1}')" == "$CANONICAL_SHA256" ]]
+          [[ "$(sha256sum manifest.json | awk '{print $1}')" == "$MANIFEST_SHA256" ]]
+          echo "LOCAL_CANONICAL_VERIFICATION=PASS"
+
+      - name: Upload temporary GitHub Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: K7-B2-fastapi-${{ steps.freeze.outputs.full_sha }}
+          path: ${{ runner.temp }}/k7-b2-fastapi/out/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Guard Drive credentials
+        shell: bash
+        env:
+          GJ_GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GJ_GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GJ_GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$GJ_GDRIVE_CLIENT_ID" || -z "$GJ_GDRIVE_CLIENT_SECRET" || -z "$GJ_GDRIVE_REFRESH_TOKEN" ]]; then
+            echo "DRIVE_AUTH_BLOCKER=Missing one or more required GitHub Actions secrets: GJ_GDRIVE_CLIENT_ID, GJ_GDRIVE_CLIENT_SECRET, GJ_GDRIVE_REFRESH_TOKEN"
+            echo "TEMP_DELETE_ALLOWED=NO"
+            exit 1
+          fi
+          echo "DRIVE_AUTH_SECRET_PRESENCE=PASS"
+
+      - name: Install Google Drive client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --quiet \
+            google-api-python-client==2.179.0 \
+            google-auth==2.40.3 \
+            google-auth-httplib2==0.2.0
+
+      - name: Upload to Drive and perform exact raw readback
+        id: drive
+        shell: bash
+        env:
+          GJ_GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GJ_GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GJ_GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          from google.oauth2.credentials import Credentials
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+
+          out = Path(os.environ["OUT_DIR"])
+          parent_id = os.environ["DRIVE_PARENT_FOLDER_ID"]
+          commit = os.environ["FROZEN_COMMIT"]
+
+          creds = Credentials(
+              token=None,
+              refresh_token=os.environ["GJ_GDRIVE_REFRESH_TOKEN"],
+              token_uri="https://oauth2.googleapis.com/token",
+              client_id=os.environ["GJ_GDRIVE_CLIENT_ID"],
+              client_secret=os.environ["GJ_GDRIVE_CLIENT_SECRET"],
+              scopes=["https://www.googleapis.com/auth/drive"],
+          )
+          service = build("drive", "v3", credentials=creds, cache_discovery=False)
+
+          def qescape(s: str) -> str:
+              return s.replace("\\", "\\\\").replace("'", "\\'")
+
+          def list_named(parent: str, name: str, mime_type: str | None = None):
+              q = f"'{parent}' in parents and trashed=false and name='{qescape(name)}'"
+              if mime_type:
+                  q += f" and mimeType='{mime_type}'"
+              res = service.files().list(
+                  q=q,
+                  fields="files(id,name,mimeType,size,parents)",
+                  pageSize=100,
+                  spaces="drive",
+              ).execute()
+              return res.get("files", [])
+
+          folders = list_named(parent_id, commit, "application/vnd.google-apps.folder")
+          if len(folders) > 1:
+              raise SystemExit("DRIVE_FOLDER_IDENTITY=FAIL duplicate immutable commit folders")
+          if folders:
+              commit_folder_id = folders[0]["id"]
+          else:
+              folder = service.files().create(
+                  body={
+                      "name": commit,
+                      "mimeType": "application/vnd.google-apps.folder",
+                      "parents": [parent_id],
+                  },
+                  fields="id,name,parents",
+              ).execute()
+              commit_folder_id = folder["id"]
+
+          def sha256_path(path: Path):
+              h = hashlib.sha256()
+              size = 0
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      size += len(chunk)
+                      h.update(chunk)
+              return size, h.hexdigest()
+
+          def raw_readback(file_id: str, dest: Path):
+              request = service.files().get_media(fileId=file_id)
+              with dest.open("wb") as f:
+                  dl = MediaIoBaseDownload(f, request, chunksize=8 * 1024 * 1024)
+                  done = False
+                  while not done:
+                      _, done = dl.next_chunk()
+              return sha256_path(dest)
+
+          def ensure_exact_file(local_path: Path):
+              local_size, local_sha = sha256_path(local_path)
+              existing = list_named(commit_folder_id, local_path.name)
+              if len(existing) > 1:
+                  raise SystemExit(f"DRIVE_OBJECT_IDENTITY=FAIL duplicate name {local_path.name}")
+
+              if existing:
+                  file_id = existing[0]["id"]
+                  reused = True
+              else:
+                  media = MediaFileUpload(
+                      str(local_path),
+                      mimetype="application/octet-stream",
+                      resumable=True,
+                      chunksize=8 * 1024 * 1024,
+                  )
+                  created = service.files().create(
+                      body={"name": local_path.name, "parents": [commit_folder_id]},
+                      media_body=media,
+                      fields="id,name,size,parents",
+                  ).execute()
+                  file_id = created["id"]
+                  reused = False
+
+              rb = out / f".readback-{local_path.name}"
+              rb_size, rb_sha = raw_readback(file_id, rb)
+              exact = rb_size == local_size and rb_sha == local_sha
+              if not exact:
+                  raise SystemExit(
+                      f"DRIVE_EXACT_READBACK=FAIL name={local_path.name} "
+                      f"local_bytes={local_size} readback_bytes={rb_size} "
+                      f"local_sha={local_sha} readback_sha={rb_sha}"
+                  )
+              rb.unlink(missing_ok=True)
+
+              return {
+                  "name": local_path.name,
+                  "drive_object_id": file_id,
+                  "reused_existing": reused,
+                  "original_bytes": local_size,
+                  "original_sha256": local_sha,
+                  "drive_readback_bytes": rb_size,
+                  "drive_readback_sha256": rb_sha,
+                  "byte_size_match": True,
+                  "sha256_match": True,
+              }
+
+          targets = [
+              out / os.environ["PACKAGE_FILENAME"],
+              out / "manifest.json",
+              out / "checksums.sha256",
+          ]
+          results = [ensure_exact_file(p) for p in targets]
+
+          receipt = {
+              "schema_version": "GJ_K7_B2_DRIVE_READBACK_V1",
+              "repository": os.environ["UPSTREAM_REPO"],
+              "branch_observed": os.environ["UPSTREAM_BRANCH"],
+              "frozen_commit": commit,
+              "root_tree": os.environ["ROOT_TREE"],
+              "capture_time_utc": os.environ["CAPTURE_UTC"],
+              "drive_parent_folder_id": parent_id,
+              "drive_commit_folder_id": commit_folder_id,
+              "objects": results,
+              "drive_readback": "PASS",
+              "user_pc_bytes_used": 0,
+              "training_performed": False,
+              "model_weights_modified": False,
+              "temp_delete_allowed": True,
+          }
+          receipt_path = out / "drive-verification.json"
+          receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          receipt_result = ensure_exact_file(receipt_path)
+
+          print("DRIVE_COMMIT_FOLDER_ID=" + commit_folder_id)
+          for item in results:
+              print(
+                  f"DRIVE_OBJECT name={item['name']} id={item['drive_object_id']} "
+                  f"bytes={item['drive_readback_bytes']} sha256={item['drive_readback_sha256']} "
+                  "READBACK=PASS"
+              )
+          print("DRIVE_VERIFICATION_RECEIPT_OBJECT_ID=" + receipt_result["drive_object_id"])
+          print("DRIVE_EXACT_READBACK=PASS")
+          print("TEMP_DELETE_ALLOWED=YES")
+          PY
+
+      - name: Final fail-closed summary
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "SOURCE=$UPSTREAM_REPO"
+          echo "BRANCH_OBSERVED=$UPSTREAM_BRANCH"
+          echo "FULL_RESOLVED_COMMIT=$FROZEN_COMMIT"
+          echo "FETCHED_COMMIT=$FETCHED_COMMIT"
+          echo "RESOLVED_COMMIT=$RESOLVED_COMMIT"
+          echo "ROOT_TREE=$ROOT_TREE"
+          echo "RESOLVED_COMMIT_MATCH=PASS"
+          echo "ROOT_TREE_NONEMPTY=PASS"
+          echo "PACKAGE_FORMAT=tar"
+          echo "PHYSICAL_BYTES=$PHYSICAL_BYTES"
+          echo "CANONICAL_SHA256=$CANONICAL_SHA256"
+          echo "MANIFEST_SHA256=$MANIFEST_SHA256"
+          echo "USER_PC_BYTES_USED=0"
+          echo "TRAINING_PERFORMED=NO"
+          echo "MODEL_WEIGHTS_MODIFIED=NO"
+          echo "FASTAPI_PHYSICAL_MIRROR_STATUS=PASS"
+          echo "TEMP_DELETE_ALLOWED=YES"
