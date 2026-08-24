@@ -18,6 +18,7 @@ jobs:
 
     env:
       GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
 
       SOURCE_RUN_ID: "32698373400"
 
@@ -117,9 +118,14 @@ jobs:
 
               tar_path = tar_files[0]
 
-              manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+              manifest = json.loads(
+                  manifest_path.read_text(encoding="utf-8")
+              )
 
-              assert manifest["schema_version"] == "GJ_K7_B1_PHYSICAL_MIRROR_V1"
+              assert (
+                  manifest["schema_version"]
+                  == "GJ_K7_B1_PHYSICAL_MIRROR_V1"
+              )
               assert manifest["repository"] == exp["repo"]
               assert manifest["pinned_commit"] == exp["commit"]
               assert manifest["resolved_commit"] == exp["commit"]
@@ -138,17 +144,34 @@ jobs:
               assert manifest["canonical_sha256"] == tar_sha
 
               checksum_entries = {}
-              for line in checksums_path.read_text(encoding="utf-8").splitlines():
+
+              for line in checksums_path.read_text(
+                  encoding="utf-8"
+              ).splitlines():
                   digest, filename = line.split(None, 1)
                   checksum_entries[filename.strip()] = digest
 
               assert checksum_entries[tar_path.name] == tar_sha
-              assert checksum_entries["manifest.json"] == sha256(manifest_path)
+              assert (
+                  checksum_entries["manifest.json"]
+                  == sha256(manifest_path)
+              )
 
-              print(f"{slug.upper()}_CANONICAL_BYTES={tar_path.stat().st_size}")
-              print(f"{slug.upper()}_CANONICAL_SHA256={tar_sha}")
-              print(f"{slug.upper()}_MANIFEST_SHA256={sha256(manifest_path)}")
-              print(f"{slug.upper()}_ARTIFACT_VERIFICATION=PASS")
+              print(
+                  f"{slug.upper()}_CANONICAL_BYTES="
+                  f"{tar_path.stat().st_size}"
+              )
+              print(
+                  f"{slug.upper()}_CANONICAL_SHA256="
+                  f"{tar_sha}"
+              )
+              print(
+                  f"{slug.upper()}_MANIFEST_SHA256="
+                  f"{sha256(manifest_path)}"
+              )
+              print(
+                  f"{slug.upper()}_ARTIFACT_VERIFICATION=PASS"
+              )
 
           print("ALL_CANONICAL_ARTIFACTS_VERIFIED=PASS")
           print("USER_PC_BYTES_USED=0")
@@ -157,6 +180,7 @@ jobs:
       - name: Install transfer dependency
         shell: bash
         run: |
+          set -euo pipefail
           python3 -m pip install --quiet requests
 
       - name: Upload to Google Drive and exact readback verify
@@ -166,7 +190,6 @@ jobs:
 
           python3 - <<'PY'
           import hashlib
-          import json
           import os
           from pathlib import Path
 
@@ -174,26 +197,39 @@ jobs:
 
           TOKEN_URL = "https://oauth2.googleapis.com/token"
           DRIVE_API = "https://www.googleapis.com/drive/v3"
-          DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3/files"
+          DRIVE_UPLOAD = (
+              "https://www.googleapis.com/upload/drive/v3/files"
+          )
 
           def sha256(path: Path) -> str:
               h = hashlib.sha256()
+
               with path.open("rb") as f:
-                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                  for chunk in iter(
+                      lambda: f.read(1024 * 1024),
+                      b"",
+                  ):
                       h.update(chunk)
+
               return h.hexdigest()
 
           token_response = requests.post(
               TOKEN_URL,
               data={
                   "client_id": os.environ["GDRIVE_CLIENT_ID"],
-                  "client_secret": os.environ["GDRIVE_CLIENT_SECRET"],
-                  "refresh_token": os.environ["GDRIVE_REFRESH_TOKEN"],
+                  "client_secret": os.environ[
+                      "GDRIVE_CLIENT_SECRET"
+                  ],
+                  "refresh_token": os.environ[
+                      "GDRIVE_REFRESH_TOKEN"
+                  ],
                   "grant_type": "refresh_token",
               },
               timeout=30,
           )
+
           token_response.raise_for_status()
+
           access_token = token_response.json()["access_token"]
 
           auth_headers = {
@@ -214,12 +250,15 @@ jobs:
                   stream=True,
                   timeout=300,
               )
+
               response.raise_for_status()
 
               h = hashlib.sha256()
               total = 0
 
-              for chunk in response.iter_content(chunk_size=1024 * 1024):
+              for chunk in response.iter_content(
+                  chunk_size=1024 * 1024
+              ):
                   if chunk:
                       total += len(chunk)
                       h.update(chunk)
@@ -228,40 +267,58 @@ jobs:
 
           def find_existing(folder_id: str, name: str):
               safe_name = name.replace("'", "\\'")
+
               response = requests.get(
                   f"{DRIVE_API}/files",
                   headers=auth_headers,
                   params={
                       "q": (
                           f"'{folder_id}' in parents and "
-                          f"name = '{safe_name}' and trashed = false"
+                          f"name = '{safe_name}' and "
+                          "trashed = false"
                       ),
                       "fields": "files(id,name,size,parents)",
                       "pageSize": 10,
                   },
                   timeout=30,
               )
+
               response.raise_for_status()
+
               return response.json().get("files", [])
 
-          def upload_resumable(path: Path, folder_id: str):
+          def upload_resumable(
+              path: Path,
+              folder_id: str,
+          ):
               local_size = path.stat().st_size
               local_sha = sha256(path)
 
-              existing = find_existing(folder_id, path.name)
+              existing = find_existing(
+                  folder_id,
+                  path.name,
+              )
 
               if len(existing) > 1:
                   raise RuntimeError(
-                      f"Multiple Drive objects already exist for {path.name}"
+                      "Multiple Drive objects already exist "
+                      f"for {path.name}"
                   )
 
               if len(existing) == 1:
                   file_id = existing[0]["id"]
-                  remote_size, remote_sha = remote_hash_and_size(file_id)
 
-                  if remote_size != local_size or remote_sha != local_sha:
+                  remote_size, remote_sha = (
+                      remote_hash_and_size(file_id)
+                  )
+
+                  if (
+                      remote_size != local_size
+                      or remote_sha != local_sha
+                  ):
                       raise RuntimeError(
-                          f"Existing Drive object mismatch for {path.name}"
+                          "Existing Drive object mismatch "
+                          f"for {path.name}"
                       )
 
                   return {
@@ -273,8 +330,12 @@ jobs:
 
               init_headers = {
                   **auth_headers,
-                  "Content-Type": "application/json; charset=UTF-8",
-                  "X-Upload-Content-Type": "application/octet-stream",
+                  "Content-Type": (
+                      "application/json; charset=UTF-8"
+                  ),
+                  "X-Upload-Content-Type": (
+                      "application/octet-stream"
+                  ),
                   "X-Upload-Content-Length": str(local_size),
               }
 
@@ -291,6 +352,7 @@ jobs:
                   },
                   timeout=30,
               )
+
               init_response.raise_for_status()
 
               upload_url = init_response.headers["Location"]
@@ -299,7 +361,9 @@ jobs:
                   upload_response = requests.put(
                       upload_url,
                       headers={
-                          "Content-Type": "application/octet-stream",
+                          "Content-Type": (
+                              "application/octet-stream"
+                          ),
                           "Content-Length": str(local_size),
                       },
                       data=f,
@@ -307,37 +371,51 @@ jobs:
                   )
 
               upload_response.raise_for_status()
+
               file_id = upload_response.json()["id"]
 
               metadata_response = requests.get(
                   f"{DRIVE_API}/files/{file_id}",
                   headers=auth_headers,
-                  params={"fields": "id,name,size,parents"},
+                  params={
+                      "fields": "id,name,size,parents"
+                  },
                   timeout=30,
               )
+
               metadata_response.raise_for_status()
+
               metadata = metadata_response.json()
 
               if int(metadata["size"]) != local_size:
                   raise RuntimeError(
-                      f"Drive metadata byte mismatch for {path.name}"
+                      "Drive metadata byte mismatch "
+                      f"for {path.name}"
                   )
 
-              if folder_id not in metadata.get("parents", []):
+              if folder_id not in metadata.get(
+                  "parents",
+                  [],
+              ):
                   raise RuntimeError(
-                      f"Drive parent mismatch for {path.name}"
+                      "Drive parent mismatch "
+                      f"for {path.name}"
                   )
 
-              remote_size, remote_sha = remote_hash_and_size(file_id)
+              remote_size, remote_sha = (
+                  remote_hash_and_size(file_id)
+              )
 
               if remote_size != local_size:
                   raise RuntimeError(
-                      f"Drive readback byte mismatch for {path.name}"
+                      "Drive readback byte mismatch "
+                      f"for {path.name}"
                   )
 
               if remote_sha != local_sha:
                   raise RuntimeError(
-                      f"Drive readback SHA256 mismatch for {path.name}"
+                      "Drive readback SHA256 mismatch "
+                      f"for {path.name}"
                   )
 
               return {
@@ -347,14 +425,18 @@ jobs:
                   "status": "UPLOADED_VERIFIED",
               }
 
-          final = {}
-
-          for slug in ("pip", "pytest", "django"):
+          for slug in (
+              "pip",
+              "pytest",
+              "django",
+          ):
               root = Path("artifacts") / slug
               tar_files = list(root.glob("*.tar"))
 
               if len(tar_files) != 1:
-                  raise RuntimeError(f"{slug}: expected exactly one TAR")
+                  raise RuntimeError(
+                      f"{slug}: expected exactly one TAR"
+                  )
 
               files = [
                   tar_files[0],
@@ -362,14 +444,16 @@ jobs:
                   root / "checksums.sha256",
               ]
 
-              repo_result = {}
-
               for path in files:
                   if not path.is_file():
-                      raise RuntimeError(f"Missing required file: {path}")
+                      raise RuntimeError(
+                          f"Missing required file: {path}"
+                      )
 
-                  result = upload_resumable(path, folder_ids[slug])
-                  repo_result[path.name] = result
+                  result = upload_resumable(
+                      path,
+                      folder_ids[slug],
+                  )
 
                   print(
                       f"{slug.upper()}_DRIVE_FILE="
@@ -380,9 +464,12 @@ jobs:
                       f"STATUS={result['status']}"
                   )
 
-              final[slug] = repo_result
-              print(f"{slug.upper()}_PHYSICAL_MIRROR_IN_DRIVE=YES")
-              print(f"{slug.upper()}_EXACT_READBACK=PASS")
+              print(
+                  f"{slug.upper()}_PHYSICAL_MIRROR_IN_DRIVE=YES"
+              )
+              print(
+                  f"{slug.upper()}_EXACT_READBACK=PASS"
+              )
 
           print("USER_PC_BYTES_USED=0")
           print("TRAINING_PERFORMED=NO")
@@ -399,15 +486,20 @@ jobs:
 
           echo "GITHUB_SOURCE_RUN=32698373400"
           echo "GITHUB_SOURCE_RUN_VERIFIED=PASS"
+
           echo "PIP_PHYSICAL_MIRROR_IN_DRIVE=YES"
           echo "PIP_EXACT_READBACK=PASS"
+
           echo "PYTEST_PHYSICAL_MIRROR_IN_DRIVE=YES"
           echo "PYTEST_EXACT_READBACK=PASS"
+
           echo "DJANGO_PHYSICAL_MIRROR_IN_DRIVE=YES"
           echo "DJANGO_EXACT_READBACK=PASS"
+
           echo "USER_PC_BYTES_USED=0"
           echo "TRAINING_PERFORMED=NO"
           echo "MODEL_WEIGHTS_MODIFIED=NO"
           echo "K7_B2_STARTED=NO"
+
           echo "TEMP_DELETE_ALLOWED=YES"
           echo "K7_B1_PHYSICAL_MIRROR_CLOSURE=PASS"
