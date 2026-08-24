@@ -1,0 +1,1236 @@
+name: GJ K7 Generic Ingestion Engine
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch:
+        description: "K7 batch to execute sequentially"
+        required: true
+        default: "B2"
+        type: choice
+        options:
+          - B2
+          - B3
+  push:
+    paths:
+      - ".github/workflows/k7-ingest.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gj-k7-generic-${{ github.ref }}-${{ inputs.batch || 'B2' }}
+  cancel-in-progress: false
+
+env:
+  K7_BATCH: ${{ inputs.batch || 'B2' }}
+  USER_PC_BYTES_USED: "0"
+  TRAINING_PERFORMED: "NO"
+  MODEL_WEIGHTS_MODIFIED: "NO"
+
+jobs:
+  ingest:
+    name: Sequential verified cloud ingestion
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+
+    steps:
+      - name: Guard immutable safety policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$USER_PC_BYTES_USED" = "0"
+          test "$TRAINING_PERFORMED" = "NO"
+          test "$MODEL_WEIGHTS_MODIFIED" = "NO"
+          case "$K7_BATCH" in
+            B2|B3) ;;
+            *) echo "BATCH_GUARD=FAIL"; exit 1 ;;
+          esac
+          echo "BATCH=$K7_BATCH"
+          echo "USER_PC_BYTES_USED=0"
+          echo "TRAINING_PERFORMED=NO"
+          echo "MODEL_WEIGHTS_MODIFIED=NO"
+
+      - name: Materialize embedded generic engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gj-k7-control"
+          cat > "$RUNNER_TEMP/gj-k7-control/k7_ingest.py" <<'PY'
+          #!/usr/bin/env python3
+          from __future__ import annotations
+          
+          import argparse
+          import hashlib
+          import io
+          import json
+          import os
+          import pathlib
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import tarfile
+          import tempfile
+          from urllib.parse import urlparse
+          from dataclasses import dataclass
+          from typing import Any
+          
+          
+          SHA40 = re.compile(r"^[0-9a-f]{40}$")
+          SHA64 = re.compile(r"^[0-9a-f]{64}$")
+          GDRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"
+          
+          
+          def fail(msg: str) -> None:
+              raise RuntimeError(msg)
+          
+          
+          def run(cmd: list[str], *, cwd: pathlib.Path | None = None, text: bool = True) -> str | bytes:
+              proc = subprocess.run(
+                  cmd,
+                  cwd=str(cwd) if cwd else None,
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=text,
+              )
+              return proc.stdout
+          
+          
+          def sha256_path(path: pathlib.Path) -> tuple[int, str]:
+              h = hashlib.sha256()
+              size = 0
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      size += len(chunk)
+                      h.update(chunk)
+              return size, h.hexdigest()
+          
+          
+          def sha256_bytes(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest()
+          
+          
+          def json_bytes(obj: Any) -> bytes:
+              return (json.dumps(obj, indent=2, sort_keys=True) + "\n").encode("utf-8")
+          
+          
+          def write_json(path: pathlib.Path, obj: Any) -> tuple[int, str]:
+              data = json_bytes(obj)
+              path.write_bytes(data)
+              return len(data), sha256_bytes(data)
+          
+          
+          def ensure_safe_relpath(rel: str) -> None:
+              if "\x00" in rel or not rel:
+                  fail(f"ARCHIVE_PATH_SAFETY=FAIL path={rel!r}")
+              p = pathlib.PurePosixPath(rel)
+              if p.is_absolute() or any(part in ("", ".", "..") for part in p.parts):
+                  fail(f"ARCHIVE_PATH_SAFETY=FAIL path={rel!r}")
+              if any(ord(ch) >= 0xD800 and ord(ch) <= 0xDFFF for ch in rel):
+                  fail(f"NON_UTF8_PATH_UNSUPPORTED=FAIL path={rel!r}")
+          
+          
+          def symlink_target_safe(rel: str, target: str) -> bool:
+              if not target or "\x00" in target:
+                  return False
+              t = pathlib.PurePosixPath(target)
+              if t.is_absolute():
+                  return False
+              stack: list[str] = list(pathlib.PurePosixPath(rel).parent.parts)
+              for part in t.parts:
+                  if part in ("", "."):
+                      continue
+                  if part == "..":
+                      if not stack:
+                          return False
+                      stack.pop()
+                  else:
+                      stack.append(part)
+              return True
+          
+          
+          def detect_license(data: bytes) -> str:
+              low = data[:256_000].lower()
+              if b"apache license" in low and b"version 2.0" in low:
+                  return "Apache-2.0"
+              if b"permission is hereby granted" in low and b"free of charge" in low:
+                  return "MIT"
+              if b"gnu general public license" in low and b"version 3" in low:
+                  return "GPL-3.0"
+              if b"gnu general public license" in low and b"version 2" in low:
+                  return "GPL-2.0"
+              if b"redistribution and use in source and binary forms" in low:
+                  if b"neither the name" in low or b"neither the names" in low:
+                      return "BSD-3-Clause"
+                  return "BSD-LIKE"
+              if b"mozilla public license" in low and b"version 2.0" in low:
+                  return "MPL-2.0"
+              return "UNKNOWN"
+          
+          
+          def git(cwd: pathlib.Path, *args: str, text: bool = True) -> str | bytes:
+              return run(["git", "-C", str(cwd), *args], text=text)
+          
+          
+          def parse_default_head(observation: str) -> tuple[str, str]:
+              branch_ref = None
+              full_sha = None
+              for line in observation.splitlines():
+                  parts = line.split()
+                  if len(parts) >= 3 and parts[0] == "ref:" and parts[2] == "HEAD":
+                      branch_ref = parts[1]
+                  elif len(parts) >= 2 and parts[1] == "HEAD" and SHA40.fullmatch(parts[0]):
+                      full_sha = parts[0]
+              if not branch_ref or not branch_ref.startswith("refs/heads/"):
+                  fail("DEFAULT_BRANCH_RESOLUTION=FAIL")
+              if not full_sha:
+                  fail("FULL_SHA_RESOLUTION=FAIL")
+              return branch_ref.removeprefix("refs/heads/"), full_sha
+          
+          
+          def root_license_candidates(repo_dir: pathlib.Path) -> list[dict[str, Any]]:
+              raw = git(repo_dir, "ls-files", "-z", text=False)
+              assert isinstance(raw, bytes)
+              paths = [p.decode("utf-8", "surrogateescape") for p in raw.split(b"\0") if p]
+              result: list[dict[str, Any]] = []
+              for rel in paths:
+                  # Root-only here. Component repos are scanned independently by this same function.
+                  pp = pathlib.PurePosixPath(rel)
+                  if len(pp.parts) != 1:
+                      continue
+                  n = pp.name.lower()
+                  if not n.startswith(("license", "licence", "copying", "notice")):
+                      continue
+                  p = repo_dir / rel
+                  if p.is_symlink() or not p.is_file():
+                      continue
+                  b = p.read_bytes()
+                  result.append(
+                      {
+                          "path": rel,
+                          "bytes": len(b),
+                          "sha256": sha256_bytes(b),
+                          "detected_license": detect_license(b),
+                      }
+                  )
+              return sorted(result, key=lambda x: x["path"].lower())
+          
+          
+          @dataclass(frozen=True)
+          class Leaf:
+              path: str
+              mode: str
+          
+          
+          @dataclass
+          class TreeScan:
+              leaves: list[Leaf]
+              components: list[dict[str, Any]]
+              gitlinks: int
+          
+          
+          def scan_recursive_tree(root: pathlib.Path) -> TreeScan:
+              leaves: list[Leaf] = []
+              components: list[dict[str, Any]] = []
+              gitlink_count = 0
+          
+              def walk(repo_dir: pathlib.Path, prefix: str = "") -> None:
+                  nonlocal gitlink_count
+                  raw = git(repo_dir, "ls-files", "--stage", "-z", text=False)
+                  assert isinstance(raw, bytes)
+                  for rec in [r for r in raw.split(b"\0") if r]:
+                      try:
+                          meta, path_b = rec.split(b"\t", 1)
+                          mode_b, sha_b, stage_b = meta.split(b" ", 2)
+                      except ValueError as exc:
+                          raise RuntimeError("GIT_INDEX_PARSE=FAIL") from exc
+                      mode = mode_b.decode("ascii")
+                      sha = sha_b.decode("ascii")
+                      stage = stage_b.decode("ascii")
+                      rel = path_b.decode("utf-8", "surrogateescape")
+                      full_rel = prefix + rel
+                      ensure_safe_relpath(full_rel)
+                      if stage != "0":
+                          fail(f"INDEX_STAGE_NONZERO=FAIL path={full_rel!r}")
+                      if mode == "160000":
+                          gitlink_count += 1
+                          subdir = repo_dir / rel
+                          if not subdir.exists():
+                              fail(f"GITLINK_MATERIALIZATION=FAIL path={full_rel!r}")
+                          actual = str(git(subdir, "rev-parse", "HEAD")).strip()
+                          tree = str(git(subdir, "rev-parse", "HEAD^{tree}")).strip()
+                          url = str(git(subdir, "remote", "get-url", "origin")).strip()
+                          if actual != sha:
+                              fail(
+                                  f"GITLINK_COMMIT_MATCH=FAIL path={full_rel} expected={sha} actual={actual}"
+                              )
+                          if not SHA40.fullmatch(tree):
+                              fail(f"GITLINK_ROOT_TREE=FAIL path={full_rel} tree={tree!r}")
+                          licenses = root_license_candidates(subdir)
+                          components.append(
+                              {
+                                  "path": full_rel,
+                                  "upstream_url": url,
+                                  "expected_gitlink_commit": sha,
+                                  "resolved_commit": actual,
+                                  "root_tree": tree,
+                                  "commit_match": True,
+                                  "license_candidates": licenses,
+                              }
+                          )
+                          walk(subdir, full_rel.rstrip("/") + "/")
+                          continue
+                      if mode not in {"100644", "100755", "120000"}:
+                          fail(f"UNSUPPORTED_GIT_MODE=FAIL path={full_rel!r} mode={mode}")
+                      leaves.append(Leaf(full_rel, mode))
+          
+              walk(root)
+              dedup: dict[str, Leaf] = {}
+              for leaf in leaves:
+                  if leaf.path in dedup and dedup[leaf.path] != leaf:
+                      fail(f"DUPLICATE_TRACKED_PATH=FAIL path={leaf.path}")
+                  dedup[leaf.path] = leaf
+              leaves = sorted(dedup.values(), key=lambda x: x.path.encode("utf-8"))
+              return TreeScan(leaves=leaves, components=components, gitlinks=gitlink_count)
+          
+          
+          def make_deterministic_tar(
+              root: pathlib.Path,
+              leaves: list[Leaf],
+              out_path: pathlib.Path,
+              prefix: str,
+              epoch: int,
+          ) -> None:
+              with tarfile.open(out_path, "w", format=tarfile.GNU_FORMAT) as tf:
+                  for leaf in leaves:
+                      ensure_safe_relpath(leaf.path)
+                      fs_path = root / leaf.path
+                      if not fs_path.exists() and not fs_path.is_symlink():
+                          fail(f"TRACKED_PATH_MISSING=FAIL path={leaf.path}")
+                      arcname = prefix.rstrip("/") + "/" + leaf.path
+                      info = tarfile.TarInfo(arcname)
+                      info.uid = 0
+                      info.gid = 0
+                      info.uname = ""
+                      info.gname = ""
+                      info.mtime = epoch
+                      if leaf.mode == "120000":
+                          if not fs_path.is_symlink():
+                              fail(f"SYMLINK_MODE_MISMATCH=FAIL path={leaf.path}")
+                          target = os.readlink(fs_path)
+                          if not symlink_target_safe(leaf.path, target):
+                              fail(f"ARCHIVE_LINK_SAFETY=FAIL path={leaf.path} target={target!r}")
+                          info.type = tarfile.SYMTYPE
+                          info.linkname = target
+                          info.mode = 0o777
+                          info.size = 0
+                          tf.addfile(info)
+                      else:
+                          if fs_path.is_symlink() or not fs_path.is_file():
+                              fail(f"FILE_MODE_MISMATCH=FAIL path={leaf.path}")
+                          st = fs_path.stat()
+                          info.type = tarfile.REGTYPE
+                          info.mode = 0o755 if leaf.mode == "100755" else 0o644
+                          info.size = st.st_size
+                          with fs_path.open("rb") as f:
+                              tf.addfile(info, fileobj=f)
+          
+          
+          def verify_tar(out_path: pathlib.Path, leaves: list[Leaf], prefix: str) -> None:
+              expected = [prefix.rstrip("/") + "/" + leaf.path for leaf in leaves]
+              with tarfile.open(out_path, "r:") as tf:
+                  members = tf.getmembers()
+                  actual = [m.name for m in members]
+                  if actual != expected:
+                      missing = sorted(set(expected) - set(actual))[:20]
+                      extra = sorted(set(actual) - set(expected))[:20]
+                      fail(f"ARCHIVE_TREE_PATH_MATCH=FAIL missing={missing} extra={extra}")
+                  for m in members:
+                      p = pathlib.PurePosixPath(m.name)
+                      if p.is_absolute() or any(part == ".." for part in p.parts):
+                          fail(f"ARCHIVE_PATH_SAFETY=FAIL member={m.name!r}")
+                      if m.islnk():
+                          fail(f"ARCHIVE_HARDLINK_UNEXPECTED=FAIL member={m.name!r}")
+                      if m.issym():
+                          rel = "/".join(p.parts[1:])
+                          if not symlink_target_safe(rel, m.linkname):
+                              fail(f"ARCHIVE_LINK_SAFETY=FAIL member={m.name!r}")
+          
+          
+          def classify_inventory(root: pathlib.Path, leaves: list[Leaf], scan: TreeScan) -> tuple[dict[str, Any], dict[str, Any]]:
+              paths = [leaf.path for leaf in leaves]
+          
+              def parts(p: str) -> tuple[str, ...]:
+                  return tuple(x.lower() for x in pathlib.PurePosixPath(p).parts)
+          
+              def is_source(p: str) -> bool:
+                  ext = pathlib.PurePosixPath(p).suffix.lower()
+                  return ext in {".py", ".pyi", ".pyx", ".pxd", ".c", ".h", ".cpp", ".hpp", ".rs"} and not is_test(p) and not is_doc(p)
+          
+              def is_test(p: str) -> bool:
+                  ps = parts(p)
+                  n = pathlib.PurePosixPath(p).name.lower()
+                  return any(x in {"test", "tests", "testing"} for x in ps) or n.startswith("test_") or n.endswith("_test.py")
+          
+              def is_doc(p: str) -> bool:
+                  ps = parts(p)
+                  ext = pathlib.PurePosixPath(p).suffix.lower()
+                  return any(x in {"doc", "docs", "documentation"} for x in ps) or ext in {".md", ".rst", ".adoc"}
+          
+              def is_ci(p: str) -> bool:
+                  ps = parts(p)
+                  return ".github" in ps or ".gitlab" in ps or "azure-pipelines" in p.lower() or "tox.ini" == p.lower()
+          
+              def is_packaging(p: str) -> bool:
+                  n = pathlib.PurePosixPath(p).name.lower()
+                  return n in {"pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "pdm.lock", "poetry.lock", "uv.lock"}
+          
+              def is_config(p: str) -> bool:
+                  n = pathlib.PurePosixPath(p).name.lower()
+                  ext = pathlib.PurePosixPath(p).suffix.lower()
+                  return n.startswith(".") or ext in {".toml", ".yaml", ".yml", ".ini", ".cfg", ".json"}
+          
+              funcs = {
+                  "SOURCE_FILES": is_source,
+                  "TEST_FILES": is_test,
+                  "DOC_FILES": is_doc,
+                  "CI_WORKFLOW_FILES": is_ci,
+                  "PACKAGING_FILES": is_packaging,
+                  "CONFIG_FILES": is_config,
+              }
+              counts = {k: sum(1 for p in paths if fn(p)) for k, fn in funcs.items()}
+              classified = {p for p in paths if any(fn(p) for fn in funcs.values())}
+          
+              component_prefixes = [c["path"].rstrip("/") + "/" for c in scan.components]
+              def under_verified_gitlink(p: str) -> bool:
+                  return any(p.startswith(pref) for pref in component_prefixes)
+          
+              vendor_parts = {"vendor", "vendors", "vendored", "third_party", "third-party", "external", "extern"}
+              vendored: list[str] = []
+              secondary_licenses: list[str] = []
+              generated_paths: list[str] = []
+              generated_text: list[str] = []
+              for p in paths:
+                  ps = parts(p)
+                  n = pathlib.PurePosixPath(p).name.lower()
+                  if any(x in vendor_parts for x in ps):
+                      vendored.append(p)
+                  if n.startswith(("license", "licence", "copying", "notice")) and len(pathlib.PurePosixPath(p).parts) > 1:
+                      secondary_licenses.append(p)
+                  if any(x in {"generated", "autogenerated", "autogen"} for x in ps):
+                      generated_paths.append(p)
+                  fp = root / p
+                  try:
+                      if fp.is_symlink() or not fp.is_file() or fp.stat().st_size > 2_000_000:
+                          continue
+                      chunk = fp.read_bytes()[:65536].lower()
+                  except OSError:
+                      continue
+                  if b"do not edit" in chunk and (b"generated" in chunk or b"auto-generated" in chunk or b"autogenerated" in chunk):
+                      generated_text.append(p)
+          
+              non_component_vendored = sorted(p for p in vendored if not under_verified_gitlink(p))
+              secondary_outside_gitlinks = sorted(p for p in secondary_licenses if not under_verified_gitlink(p))
+          
+              component_payload = {
+                  "gitlinks": scan.gitlinks,
+                  "components": scan.components,
+                  "all_gitlink_commits_verified": all(c.get("commit_match") for c in scan.components),
+                  "all_component_license_candidates_recognized": all(
+                      c.get("license_candidates")
+                      and all(x.get("detected_license") != "UNKNOWN" for x in c["license_candidates"])
+                      for c in scan.components
+                  ) if scan.components else True,
+              }
+          
+              inventory = {
+                  "TOTAL_FILES": len(paths),
+                  **counts,
+                  "OTHER_FILES": len(set(paths) - classified),
+                  "GITLINKS": scan.gitlinks,
+                  "ARCHIVE_TREE_PATH_MATCH": "PASS",
+                  "ARCHIVE_PATH_SAFETY": "PASS",
+                  "ARCHIVE_LINK_SAFETY": "PASS",
+                  "classification_note": "Categories may overlap; TOTAL_FILES includes recursively materialized tracked gitlink/submodule leaf paths.",
+              }
+              risk_scan = {
+                  "third_party_or_vendored_content_present": bool(vendored or scan.gitlinks),
+                  "vendored_path_count": len(vendored),
+                  "vendored_path_sample": sorted(vendored)[:100],
+                  "non_gitlink_vendored_path_count": len(non_component_vendored),
+                  "non_gitlink_vendored_path_sample": non_component_vendored[:100],
+                  "secondary_license_files": sorted(secondary_licenses)[:200],
+                  "secondary_license_files_outside_gitlinks": secondary_outside_gitlinks[:200],
+                  "generated_path_candidates": sorted(generated_paths)[:100],
+                  "generated_text_marker_candidates": sorted(generated_text)[:100],
+                  "gitlink_components": component_payload,
+              }
+              return inventory, risk_scan
+          
+          
+          def rights_decision(root_licenses: list[dict[str, Any]], component_scan: dict[str, Any]) -> dict[str, str]:
+              recognized_root = [x for x in root_licenses if x["detected_license"] != "UNKNOWN"]
+              component = component_scan["gitlink_components"]
+              comp_ok = component.get("all_component_license_candidates_recognized", False)
+              has_unreviewed_vendored = bool(component_scan.get("non_gitlink_vendored_path_count", 0))
+              has_secondary_outside = bool(component_scan.get("secondary_license_files_outside_gitlinks"))
+          
+              if not recognized_root:
+                  reference = "BLOCKED_PENDING_ROOT_LICENSE_REVIEW"
+                  retrieval = "BLOCKED_PENDING_LICENSE_REVIEW"
+              else:
+                  reference = "YES_WITH_NOTICE"
+                  if has_unreviewed_vendored or has_secondary_outside:
+                      retrieval = "BLOCKED_PENDING_COMPONENT_LICENSE_REVIEW"
+                  elif component.get("gitlinks", 0) and not comp_ok:
+                      retrieval = "BLOCKED_PENDING_COMPONENT_LICENSE_REVIEW"
+                  elif component.get("gitlinks", 0):
+                      retrieval = "YES_SELECTED_VERIFIED_PROJECT_MATERIAL_WITH_COMPONENT_NOTICES"
+                  else:
+                      retrieval = "YES_SELECTED_VERIFIED_PROJECT_MATERIAL_WITH_LICENSE_NOTICE"
+              return {
+                  "REFERENCE_ALLOWED": reference,
+                  "RETRIEVAL_ALLOWED": retrieval,
+                  "TRAINING_ALLOWED": "NO",
+                  "COMMERCIAL_TRAINING_ALLOWED": "NO",
+              }
+          
+          
+          class DriveStore:
+              def __init__(self) -> None:
+                  from google.oauth2.credentials import Credentials
+                  from googleapiclient.discovery import build
+          
+                  cid = os.environ.get("GDRIVE_CLIENT_ID", "")
+                  csecret = os.environ.get("GDRIVE_CLIENT_SECRET", "")
+                  refresh = os.environ.get("GDRIVE_REFRESH_TOKEN", "")
+                  if not (cid and csecret and refresh):
+                      fail("DRIVE_AUTH_BLOCKER=Missing GDRIVE_CLIENT_ID/GDRIVE_CLIENT_SECRET/GDRIVE_REFRESH_TOKEN")
+                  creds = Credentials(
+                      token=None,
+                      refresh_token=refresh,
+                      token_uri="https://oauth2.googleapis.com/token",
+                      client_id=cid,
+                      client_secret=csecret,
+                      scopes=["https://www.googleapis.com/auth/drive"],
+                  )
+                  self.service = build("drive", "v3", credentials=creds, cache_discovery=False)
+          
+              @staticmethod
+              def qescape(s: str) -> str:
+                  return s.replace("\\", "\\\\").replace("'", "\\'")
+          
+              def _list_all(self, *, q: str, fields: str, page_size: int = 1000) -> list[dict[str, Any]]:
+                  rows: list[dict[str, Any]] = []
+                  token: str | None = None
+                  while True:
+                      res = self.service.files().list(
+                          q=q,
+                          fields=f"nextPageToken,files({fields})",
+                          pageSize=page_size,
+                          spaces="drive",
+                          pageToken=token,
+                      ).execute()
+                      rows.extend(res.get("files", []))
+                      token = res.get("nextPageToken")
+                      if not token:
+                          return rows
+          
+              def list_named(self, parent: str, name: str, mime_type: str | None = None) -> list[dict[str, Any]]:
+                  q = f"'{parent}' in parents and trashed=false and name='{self.qescape(name)}'"
+                  if mime_type:
+                      q += f" and mimeType='{mime_type}'"
+                  return self._list_all(q=q, fields="id,name,mimeType,size,parents", page_size=100)
+          
+              def list_children(self, parent: str) -> list[dict[str, Any]]:
+                  q = f"'{parent}' in parents and trashed=false"
+                  return self._list_all(q=q, fields="id,name,mimeType,size,parents", page_size=1000)
+          
+              def ensure_folder(self, parent: str, name: str) -> str:
+                  rows = self.list_named(parent, name, GDRIVE_FOLDER_MIME)
+                  if len(rows) > 1:
+                      fail(f"DRIVE_FOLDER_IDENTITY=FAIL duplicate folder name={name!r}")
+                  if rows:
+                      return rows[0]["id"]
+                  created = self.service.files().create(
+                      body={"name": name, "mimeType": GDRIVE_FOLDER_MIME, "parents": [parent]},
+                      fields="id,name,parents",
+                  ).execute()
+                  return created["id"]
+          
+              def raw_bytes(self, file_id: str) -> bytes:
+                  from googleapiclient.http import MediaIoBaseDownload
+          
+                  request = self.service.files().get_media(fileId=file_id)
+                  buf = io.BytesIO()
+                  dl = MediaIoBaseDownload(buf, request, chunksize=8 * 1024 * 1024)
+                  done = False
+                  while not done:
+                      _, done = dl.next_chunk()
+                  return buf.getvalue()
+          
+              def stream_readback_hash(self, file_id: str) -> tuple[int, str]:
+                  from googleapiclient.http import MediaIoBaseDownload
+          
+                  fd, temp_name = tempfile.mkstemp(prefix="gj-drive-readback-")
+                  os.close(fd)
+                  temp_path = pathlib.Path(temp_name)
+                  try:
+                      request = self.service.files().get_media(fileId=file_id)
+                      with temp_path.open("wb") as f:
+                          dl = MediaIoBaseDownload(f, request, chunksize=8 * 1024 * 1024)
+                          done = False
+                          while not done:
+                              _, done = dl.next_chunk()
+                      return sha256_path(temp_path)
+                  finally:
+                      temp_path.unlink(missing_ok=True)
+          
+              def upload_or_reuse_exact(self, parent: str, path: pathlib.Path) -> dict[str, Any]:
+                  from googleapiclient.http import MediaFileUpload
+          
+                  size, sha = sha256_path(path)
+                  rows = self.list_named(parent, path.name)
+                  if len(rows) > 1:
+                      fail(f"DRIVE_OBJECT_IDENTITY=FAIL duplicate name={path.name!r}")
+                  reused = bool(rows)
+                  if rows:
+                      file_id = rows[0]["id"]
+                  else:
+                      media = MediaFileUpload(
+                          str(path),
+                          mimetype="application/octet-stream",
+                          resumable=True,
+                          chunksize=8 * 1024 * 1024,
+                      )
+                      created = self.service.files().create(
+                          body={"name": path.name, "parents": [parent]},
+                          media_body=media,
+                          fields="id,name,size,parents",
+                      ).execute()
+                      file_id = created["id"]
+                  rb_size, rb_sha = self.stream_readback_hash(file_id)
+                  if rb_size != size or rb_sha != sha:
+                      fail(f"DRIVE_EXACT_READBACK=FAIL name={path.name} local=({size},{sha}) drive=({rb_size},{rb_sha})")
+                  return {
+                      "name": path.name,
+                      "object_id": file_id,
+                      "local_bytes": size,
+                      "local_sha256": sha,
+                      "drive_readback_bytes": rb_size,
+                      "drive_readback_sha256": rb_sha,
+                      "reused": reused,
+                      "readback": "PASS",
+                  }
+          
+              def verify_preclosed(self, item: dict[str, Any]) -> dict[str, Any]:
+                  pre = item.get("preclosed") or {}
+                  oid = pre.get("final_record_object_id")
+                  expected_sha = pre.get("final_record_sha256")
+                  if not oid:
+                      fail("PRECLOSED_RECORD_ID_MISSING")
+                  b = self.raw_bytes(oid)
+                  sha = sha256_bytes(b)
+                  if expected_sha and sha != expected_sha:
+                      fail(f"PRECLOSED_FINAL_RECORD_SHA=FAIL repo={item['repo']}")
+                  try:
+                      obj = json.loads(b)
+                  except json.JSONDecodeError as exc:
+                      raise RuntimeError("PRECLOSED_FINAL_RECORD_JSON=FAIL") from exc
+                  text = b.decode("utf-8", "replace")
+                  for needle in (item["repo"].split("/")[-1], "PASS"):
+                      if needle.lower() not in text.lower():
+                          fail(f"PRECLOSED_FINAL_RECORD_CONTENT=FAIL missing={needle!r}")
+                  return {
+                      "repo": item["repo"],
+                      "status": "PASS_PREEXISTING_VERIFIED",
+                      "full_resolved_commit": pre.get("full_resolved_commit"),
+                      "root_tree": pre.get("root_tree"),
+                      "physical_bytes": pre.get("physical_bytes"),
+                      "canonical_sha256": pre.get("canonical_sha256"),
+                      "final_record_object_id": oid,
+                      "final_record_bytes": len(b),
+                      "final_record_sha256": sha,
+                  }
+          
+              def discover_closed(self, repo_folder: str, repo: str) -> dict[str, Any] | None:
+                  for commit_folder in self.list_children(repo_folder):
+                      if commit_folder.get("mimeType") != GDRIVE_FOLDER_MIME:
+                          continue
+                      commit = commit_folder.get("name", "")
+                      if not SHA40.fullmatch(commit):
+                          continue
+                      children = self.list_children(commit_folder["id"])
+                      by_name = {c.get("name", ""): c for c in children}
+                      for fname, child in by_name.items():
+                          if "FINAL_DRIVE_RECORD" not in fname or not fname.endswith(".json"):
+                              continue
+                          sidecar = by_name.get(fname + ".sha256")
+                          if not sidecar:
+                              continue
+                          b = self.raw_bytes(child["id"])
+                          side = self.raw_bytes(sidecar["id"]).decode("utf-8", "strict").strip()
+                          expected = side.split()[0] if side else ""
+                          actual = sha256_bytes(b)
+                          if not SHA64.fullmatch(expected) or expected != actual:
+                              continue
+                          try:
+                              obj = json.loads(b)
+                          except json.JSONDecodeError:
+                              continue
+                          if (
+                              obj.get("source") == repo
+                              and obj.get("source_final") == "PASS"
+                              and obj.get("full_resolved_commit") == commit
+                              and SHA64.fullmatch(str(obj.get("canonical_sha256", "")))
+                          ):
+                              return {
+                                  "repo": repo,
+                                  "status": "PASS_DISCOVERED_IN_DRIVE",
+                                  "full_resolved_commit": commit,
+                                  "root_tree": obj.get("root_tree"),
+                                  "physical_bytes": obj.get("physical_bytes"),
+                                  "canonical_sha256": obj.get("canonical_sha256"),
+                                  "final_record_object_id": child["id"],
+                                  "final_record_bytes": len(b),
+                                  "final_record_sha256": actual,
+                              }
+                  return None
+          
+          
+          def validate_submodule_urls(repo_dir: pathlib.Path) -> list[str]:
+              gm = repo_dir / ".gitmodules"
+              if not gm.exists():
+                  return []
+              proc = subprocess.run(
+                  ["git", "-C", str(repo_dir), "config", "-f", ".gitmodules", "--get-regexp", r"^submodule\..*\.url$"],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+              )
+              if proc.returncode not in (0, 1):
+                  fail("GITMODULES_PARSE=FAIL")
+              urls: list[str] = []
+              for line in proc.stdout.splitlines():
+                  parts = line.split(None, 1)
+                  if len(parts) != 2:
+                      fail("GITMODULES_URL_PARSE=FAIL")
+                  url = parts[1].strip()
+                  urls.append(url)
+                  if url.startswith(("./", "../")):
+                      continue
+                  parsed = urlparse(url)
+                  if parsed.scheme != "https" or parsed.hostname != "github.com":
+                      fail(f"SUBMODULE_URL_POLICY=FAIL url={url!r}")
+              return urls
+          
+          
+          def process_source(
+              store: DriveStore,
+              *,
+              batch: str,
+              item: dict[str, Any],
+              batch_folder: str,
+              staging_root: pathlib.Path,
+          ) -> dict[str, Any]:
+              repo = item["repo"]
+              slug = item["slug"]
+              repo_folder = store.ensure_folder(batch_folder, slug)
+          
+              discovered = store.discover_closed(repo_folder, repo)
+              if discovered:
+                  print(f"SOURCE={repo}")
+                  print("SOURCE_FINAL=PASS_ALREADY_CLOSED_IN_DRIVE")
+                  return discovered
+          
+              url = f"https://github.com/{repo}.git"
+              observation = str(run(["git", "ls-remote", "--symref", url, "HEAD"]))
+              branch, frozen = parse_default_head(observation)
+              capture_utc = str(run(["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"])).strip()
+          
+              work = pathlib.Path(tempfile.mkdtemp(prefix=f"gj-k7-{slug}-"))
+              temp_delete_allowed = False
+              repo_dir = work / "repo"
+              repo_dir.mkdir()
+              out_dir = staging_root / slug
+              out_dir.mkdir(parents=True, exist_ok=True)
+              try:
+                  git(repo_dir, "init", "-q")
+                  git(repo_dir, "remote", "add", "origin", url)
+                  git(repo_dir, "fetch", "--depth=1", "--no-tags", "origin", frozen)
+                  fetched = str(git(repo_dir, "rev-parse", "FETCH_HEAD")).strip()
+                  resolved = str(git(repo_dir, "rev-parse", f"{frozen}^{{commit}}")).strip()
+                  root_tree = str(git(repo_dir, "rev-parse", f"{frozen}^{{tree}}")).strip()
+                  epoch_s = str(git(repo_dir, "show", "-s", "--format=%ct", frozen)).strip()
+                  if fetched != frozen or resolved != frozen or not SHA40.fullmatch(root_tree) or not epoch_s.isdigit():
+                      fail(f"IDENTITY_VERIFICATION=FAIL repo={repo}")
+                  epoch = int(epoch_s)
+                  git(repo_dir, "checkout", "--detach", "-q", frozen)
+                  submodule_urls = validate_submodule_urls(repo_dir)
+                  git(repo_dir, "submodule", "sync", "--recursive")
+                  run([
+                      "git", "-C", str(repo_dir),
+                      "-c", "protocol.allow=never",
+                      "-c", "protocol.https.allow=always",
+                      "submodule", "update", "--init", "--recursive", "--jobs", "1"
+                  ])
+          
+                  scan = scan_recursive_tree(repo_dir)
+                  if scan.components and not all(c["commit_match"] for c in scan.components):
+                      fail("GITLINK_VERIFICATION=FAIL")
+          
+                  package = out_dir / f"{slug}_{frozen}.tar"
+                  prefix = f"{slug}_{frozen}"
+                  make_deterministic_tar(repo_dir, scan.leaves, package, prefix, epoch)
+                  verify_tar(package, scan.leaves, prefix)
+                  physical_bytes, canonical_sha = sha256_path(package)
+                  if physical_bytes <= 0 or not SHA64.fullmatch(canonical_sha):
+                      fail("CANONICAL_PACKAGE_HASH=FAIL")
+          
+                  inventory, component_scan = classify_inventory(repo_dir, scan.leaves, scan)
+                  root_licenses = root_license_candidates(repo_dir)
+                  rights = rights_decision(root_licenses, component_scan)
+          
+                  manifest = {
+                      "schema_version": "GJ_K7_GENERIC_PHYSICAL_MIRROR_V1",
+                      "batch": batch,
+                      "repository": repo,
+                      "slug": slug,
+                      "upstream_url": url,
+                      "branch_observed": branch,
+                      "default_branch_observation_count": 1,
+                      "full_resolved_commit": frozen,
+                      "fetched_commit": fetched,
+                      "resolved_commit": resolved,
+                      "root_tree": root_tree,
+                      "identity_verification": {
+                          "full_sha_length_40": len(frozen) == 40,
+                          "fetched_commit_equals_frozen_commit": fetched == frozen,
+                          "resolved_commit_equals_frozen_commit": resolved == frozen,
+                          "root_tree_literal_nonempty": bool(SHA40.fullmatch(root_tree)),
+                          "gitlinks_verified": all(c["commit_match"] for c in scan.components),
+                      },
+                      "acquisition_method": "single ls-remote --symref HEAD observation; freeze exact SHA; fetch exact SHA; recursive exact gitlink materialization",
+                      "submodule_url_policy": {"allowed": "https://github.com or relative GitHub URL", "declared_count": len(submodule_urls)},
+                      "package_filename": package.name,
+                      "package_format": "tar",
+                      "package_construction": "deterministic Python GNU TAR from recursively verified tracked leaf paths; export-ignore not honored; .git metadata excluded",
+                      "physical_bytes": physical_bytes,
+                      "canonical_sha256": canonical_sha,
+                      "file_inventory": inventory,
+                      "root_license_candidates": root_licenses,
+                      "component_scan": component_scan,
+                      "rights": rights,
+                      "drive_batch_folder_id": batch_folder,
+                      "drive_repository_folder_id": repo_folder,
+                      "user_pc_bytes_used": 0,
+                      "training_performed": False,
+                      "training_release_created": False,
+                      "model_weights_modified": False,
+                  }
+                  if not all(manifest["identity_verification"].values()):
+                      fail("IDENTITY_VERIFICATION=FAIL")
+          
+                  manifest_path = out_dir / "manifest.json"
+                  manifest_bytes, manifest_sha = write_json(manifest_path, manifest)
+                  checksums_path = out_dir / "checksums.sha256"
+                  checksums_path.write_text(
+                      f"{canonical_sha}  {package.name}\n{manifest_sha}  manifest.json\n",
+                      encoding="utf-8",
+                  )
+                  checksums_bytes, checksums_sha = sha256_path(checksums_path)
+          
+                  commit_folder = store.ensure_folder(repo_folder, frozen)
+                  tar_result = store.upload_or_reuse_exact(commit_folder, package)
+                  manifest_result = store.upload_or_reuse_exact(commit_folder, manifest_path)
+                  checksums_result = store.upload_or_reuse_exact(commit_folder, checksums_path)
+          
+                  run_id = os.environ.get("GITHUB_RUN_ID", "UNKNOWN")
+                  run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "UNKNOWN")
+                  receipt = {
+                      "schema": "GJ_K7_GENERIC_WORKER_RECEIPT_V2",
+                      "batch": batch,
+                      "source": repo,
+                      "full_resolved_commit": frozen,
+                      "root_tree": root_tree,
+                      "capture_time_utc": capture_utc,
+                      "worker_repository": os.environ.get("GITHUB_REPOSITORY", "UNKNOWN"),
+                      "workflow": os.environ.get("GITHUB_WORKFLOW", "UNKNOWN"),
+                      "workflow_ref": os.environ.get("GITHUB_WORKFLOW_REF", "UNKNOWN"),
+                      "run_id": run_id,
+                      "run_attempt": run_attempt,
+                      "run_number": os.environ.get("GITHUB_RUN_NUMBER", "UNKNOWN"),
+                      "runner_os": os.environ.get("RUNNER_OS", sys.platform),
+                      "runner_arch": os.environ.get("RUNNER_ARCH", "UNKNOWN"),
+                      "git_version": str(run(["git", "--version"])).strip(),
+                      "objects": {
+                          "tar": tar_result,
+                          "manifest": manifest_result,
+                          "checksums": checksums_result,
+                      },
+                      "exact_drive_readback": "PASS",
+                      "user_pc_bytes_used": 0,
+                      "training_performed": False,
+                      "model_weights_modified": False,
+                  }
+                  receipt_name = f"worker-receipt-{run_id}-{run_attempt}.json"
+                  receipt_path = out_dir / receipt_name
+                  receipt_bytes, receipt_sha = write_json(receipt_path, receipt)
+                  receipt_result = store.upload_or_reuse_exact(commit_folder, receipt_path)
+          
+                  final_record = {
+                      "schema": "GJ_K7_GENERIC_FINAL_DRIVE_RECORD_V2",
+                      "batch": batch,
+                      "source": repo,
+                      "source_final": "PASS",
+                      "branch_observed": branch,
+                      "full_resolved_commit": frozen,
+                      "root_tree": root_tree,
+                      "workflow_run_id": run_id,
+                      "workflow_run_attempt": run_attempt,
+                      "physical_bytes": physical_bytes,
+                      "canonical_sha256": canonical_sha,
+                      "manifest_sha256": manifest_sha,
+                      "checksums_sha256": checksums_sha,
+                      "worker_receipt_sha256": receipt_sha,
+                      "drive_objects": {
+                          "tar": tar_result["object_id"],
+                          "manifest": manifest_result["object_id"],
+                          "checksums": checksums_result["object_id"],
+                          "worker_receipt": receipt_result["object_id"],
+                      },
+                      "drive_readback_bytes": tar_result["drive_readback_bytes"],
+                      "drive_readback_sha256": tar_result["drive_readback_sha256"],
+                      "byte_size_match": "PASS",
+                      "sha256_match": "PASS",
+                      "file_inventory": inventory,
+                      "component_scan": component_scan,
+                      "archive_path_safety": "PASS",
+                      "archive_link_safety": "PASS",
+                      "rights": rights,
+                      "user_pc_bytes_used": 0,
+                      "training_performed": False,
+                      "training_release_created": False,
+                      "model_weights_modified": False,
+                      "temp_delete_allowed": True,
+                  }
+                  final_name = f"GJ_K7_{batch}_{slug.upper().replace('-', '_')}_FINAL_DRIVE_RECORD_V2_{run_id}_{run_attempt}.json"
+                  final_path = out_dir / final_name
+                  final_bytes, final_sha = write_json(final_path, final_record)
+                  final_result = store.upload_or_reuse_exact(commit_folder, final_path)
+          
+                  sidecar_path = out_dir / (final_name + ".sha256")
+                  sidecar_path.write_text(f"{final_sha}  {final_name}\n", encoding="utf-8")
+                  sidecar_result = store.upload_or_reuse_exact(commit_folder, sidecar_path)
+                  sidecar_raw = store.raw_bytes(sidecar_result["object_id"]).decode("utf-8", "strict").strip()
+                  if sidecar_raw.split()[0] != final_sha:
+                      fail("FINAL_RECORD_SIDECAR_READBACK=FAIL")
+          
+          
+                  temp_delete_allowed = True
+                  result = {
+                      "repo": repo,
+                      "status": "PASS",
+                      "branch_observed": branch,
+                      "full_resolved_commit": frozen,
+                      "root_tree": root_tree,
+                      "physical_bytes": physical_bytes,
+                      "canonical_sha256": canonical_sha,
+                      "manifest_sha256": manifest_sha,
+                      "checksums_sha256": checksums_sha,
+                      "worker_receipt_sha256": receipt_sha,
+                      "final_record_object_id": final_result["object_id"],
+                      "final_record_bytes": final_bytes,
+                      "final_record_sha256": final_sha,
+                      "final_record_raw_readback": "PASS",
+                      "final_record_sidecar_object_id": sidecar_result["object_id"],
+                      "rights": rights,
+                      "inventory": inventory,
+                      "temp_delete_allowed": True,
+                  }
+                  print(f"SOURCE={repo}")
+                  print("SOURCE_FINAL=PASS")
+                  print(f"FULL_RESOLVED_COMMIT={frozen}")
+                  print(f"ROOT_TREE={root_tree}")
+                  print(f"PHYSICAL_BYTES={physical_bytes}")
+                  print(f"CANONICAL_SHA256={canonical_sha}")
+                  print(f"MANIFEST_SHA256={manifest_sha}")
+                  print(f"FINAL_RECORD_OBJECT={final_result['object_id']}")
+                  print("FINAL_RECORD_RAW_READBACK=PASS")
+                  print("FINAL_RECORD_SIDECAR_READBACK=PASS")
+                  print("USER_PC_BYTES_USED=0")
+                  print("TRAINING_PERFORMED=NO")
+                  print("MODEL_WEIGHTS_MODIFIED=NO")
+                  print("TEMP_DELETE_ALLOWED=YES")
+                  # Drive is now the verified cold master; keep only small proof records for the success artifact.
+                  for p in (package, manifest_path, checksums_path):
+                      p.unlink(missing_ok=True)
+                  return result
+              finally:
+                  # Fail closed: never intentionally delete temporary cloud-worker bytes before the
+                  # final Drive record has itself passed exact raw readback. Runner teardown is
+                  # outside this script; this script only deletes after the proof gate.
+                  if temp_delete_allowed:
+                      shutil.rmtree(work, ignore_errors=True)
+          
+          
+          def validate_config(config: dict[str, Any]) -> None:
+              if config.get("schema") != "GJ_K7_INGEST_SOURCES_V1":
+                  fail("CONFIG_SCHEMA=FAIL")
+              if not config.get("drive_code_parent_id"):
+                  fail("CONFIG_DRIVE_CODE_PARENT_ID=FAIL")
+              seen: set[str] = set()
+              for batch, items in config.get("batches", {}).items():
+                  if not re.fullmatch(r"B[0-9]+", batch):
+                      fail(f"CONFIG_BATCH_NAME=FAIL batch={batch!r}")
+                  if not isinstance(items, list) or not items:
+                      fail(f"CONFIG_BATCH_EMPTY=FAIL batch={batch}")
+                  for item in items:
+                      repo = item.get("repo", "")
+                      slug = item.get("slug", "")
+                      if not re.fullmatch(r"[^/]+/[^/]+", repo):
+                          fail(f"CONFIG_REPO=FAIL repo={repo!r}")
+                      if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", slug):
+                          fail(f"CONFIG_SLUG=FAIL slug={slug!r}")
+                      key = f"{batch}:{repo}"
+                      if key in seen:
+                          fail(f"CONFIG_DUPLICATE=FAIL {key}")
+                      seen.add(key)
+                      pre = item.get("preclosed")
+                      if pre:
+                          if not SHA40.fullmatch(pre.get("full_resolved_commit", "")):
+                              fail(f"CONFIG_PRECLOSED_COMMIT=FAIL repo={repo}")
+                          if not SHA40.fullmatch(pre.get("root_tree", "")):
+                              fail(f"CONFIG_PRECLOSED_TREE=FAIL repo={repo}")
+                          if not SHA64.fullmatch(pre.get("canonical_sha256", "")):
+                              fail(f"CONFIG_PRECLOSED_SHA=FAIL repo={repo}")
+                          if not SHA64.fullmatch(pre.get("final_record_sha256", "")):
+                              fail(f"CONFIG_PRECLOSED_FINAL_SHA=FAIL repo={repo}")
+              print("CONFIG_VALIDATION=PASS")
+          
+          
+          def main() -> int:
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--config", required=True)
+              ap.add_argument("--batch", required=True)
+              ap.add_argument("--validate-only", action="store_true")
+              args = ap.parse_args()
+          
+              config = json.loads(pathlib.Path(args.config).read_text(encoding="utf-8"))
+              validate_config(config)
+              if args.validate_only:
+                  return 0
+              batch = args.batch.upper()
+              if batch not in config["batches"]:
+                  fail(f"BATCH_NOT_CONFIGURED={batch}")
+          
+              print("USER_PC_BYTES_USED=0")
+              print("TRAINING_PERFORMED=NO")
+              print("MODEL_WEIGHTS_MODIFIED=NO")
+              print(f"BATCH={batch}")
+          
+              store = DriveStore()
+              batch_folder = store.ensure_folder(
+                  config["drive_code_parent_id"],
+                  f"K7_{batch}_PHYSICAL_MIRRORS",
+              )
+              staging_root = pathlib.Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir())) / "gj-k7-artifacts" / batch
+              staging_root.mkdir(parents=True, exist_ok=True)
+          
+              results: list[dict[str, Any]] = []
+              for item in config["batches"][batch]:
+                  if item.get("preclosed"):
+                      verified = store.verify_preclosed(item)
+                      print(f"SOURCE={item['repo']}")
+                      print("SOURCE_FINAL=PASS_PREEXISTING_VERIFIED")
+                      results.append(verified)
+                      continue
+                  result = process_source(
+                      store,
+                      batch=batch,
+                      item=item,
+                      batch_folder=batch_folder,
+                      staging_root=staging_root,
+                  )
+                  results.append(result)
+          
+              if len(results) != len(config["batches"][batch]) or not all(str(r.get("status", "")).startswith("PASS") for r in results):
+                  fail(f"K7_{batch}_FINAL=FAIL")
+          
+              stable_sources = []
+              for r in results:
+                  stable_sources.append({
+                      "repo": r.get("repo"),
+                      "status": "PASS",
+                      "full_resolved_commit": r.get("full_resolved_commit") or (r.get("configured_evidence") or {}).get("full_resolved_commit"),
+                      "root_tree": r.get("root_tree") or (r.get("configured_evidence") or {}).get("root_tree"),
+                      "physical_bytes": r.get("physical_bytes") or (r.get("configured_evidence") or {}).get("physical_bytes"),
+                      "canonical_sha256": r.get("canonical_sha256") or (r.get("configured_evidence") or {}).get("canonical_sha256"),
+                      "final_record_object_id": r.get("final_record_object_id"),
+                      "final_record_sha256": r.get("final_record_sha256"),
+                  })
+              batch_record = {
+                  "schema": "GJ_K7_GENERIC_BATCH_FINAL_V2",
+                  "batch": batch,
+                  f"k7_{batch.lower()}_final": "PASS",
+                  "sources": stable_sources,
+                  "source_count": len(stable_sources),
+                  "user_pc_bytes_used": 0,
+                  "training_performed": False,
+                  "training_release_created": False,
+                  "model_weights_modified": False,
+                  "next_batch_started": False,
+              }
+              batch_data = json_bytes(batch_record)
+              batch_sha = sha256_bytes(batch_data)
+              batch_path = staging_root / f"GJ_K7_{batch}_FINAL_BATCH_RECORD_V2_{batch_sha[:16]}.json"
+              batch_path.write_bytes(batch_data)
+              batch_bytes = len(batch_data)
+              batch_result = store.upload_or_reuse_exact(batch_folder, batch_path)
+              print(f"K7_{batch}_FINAL=PASS")
+              print(f"BATCH_FINAL_RECORD_OBJECT={batch_result['object_id']}")
+              print(f"BATCH_FINAL_RECORD_BYTES={batch_bytes}")
+              print(f"BATCH_FINAL_RECORD_SHA256={batch_sha}")
+              print("BATCH_FINAL_RECORD_RAW_READBACK=PASS")
+              print("NEXT_BATCH_STARTED=NO")
+              print("NEXT_BATCH_STARTED=NO")
+              return 0
+          
+          
+          if __name__ == "__main__":
+              try:
+                  raise SystemExit(main())
+              except Exception as exc:
+                  print(f"GJ_K7_GENERIC_INGEST=FAIL error={exc}", file=sys.stderr)
+                  print("USER_PC_BYTES_USED=0", file=sys.stderr)
+                  print("TRAINING_PERFORMED=NO", file=sys.stderr)
+                  print("MODEL_WEIGHTS_MODIFIED=NO", file=sys.stderr)
+                  raise
+          PY
+          cat > "$RUNNER_TEMP/gj-k7-control/sources.json" <<'JSON'
+          {
+            "schema": "GJ_K7_INGEST_SOURCES_V1",
+            "drive_code_parent_id": "1sVIAQ3-F4UILCXpqCJXMvLW45zWc64Ph",
+            "artifact_retention_days": 7,
+            "batches": {
+              "B2": [
+                {
+                  "repo": "fastapi/fastapi",
+                  "slug": "fastapi",
+                  "preclosed": {
+                    "final_record_object_id": "1k5smVh5zzesEIxaKl4d0SvXzxmArlajq",
+                    "final_record_sha256": "41d0c71d907bacb7ede11cc8862b58778211ce92215dbbf7fec293fbdfa4cab2",
+                    "full_resolved_commit": "c3f316b7e814667e8ee81e03a7330d00ee61e45c",
+                    "root_tree": "99e67ce7923ae58e408d9eb0afaf2ef039bfa85f",
+                    "physical_bytes": 36976640,
+                    "canonical_sha256": "7ccb1169a9547e04282ac456ef1d0e48d3ea975e562f0c0e1836478cc5fd9cc5"
+                  }
+                },
+                {
+                  "repo": "aio-libs/aiohttp",
+                  "slug": "aiohttp"
+                },
+                {
+                  "repo": "sqlalchemy/sqlalchemy",
+                  "slug": "sqlalchemy"
+                }
+              ],
+              "B3": [
+                {
+                  "repo": "pandas-dev/pandas",
+                  "slug": "pandas"
+                },
+                {
+                  "repo": "scikit-learn/scikit-learn",
+                  "slug": "scikit-learn"
+                },
+                {
+                  "repo": "ansible/ansible",
+                  "slug": "ansible"
+                },
+                {
+                  "repo": "home-assistant/core",
+                  "slug": "home-assistant-core"
+                }
+              ]
+            }
+          }
+          JSON
+          python3 -m py_compile "$RUNNER_TEMP/gj-k7-control/k7_ingest.py"
+          python3 - <<'PY'
+          import json, os
+          p=os.path.join(os.environ['RUNNER_TEMP'],'gj-k7-control','sources.json')
+          cfg=json.load(open(p, encoding='utf-8'))
+          assert cfg['schema']=='GJ_K7_INGEST_SOURCES_V1'
+          assert cfg['drive_code_parent_id']=='1sVIAQ3-F4UILCXpqCJXMvLW45zWc64Ph'
+          print('EMBEDDED_ENGINE_MATERIALIZATION=PASS')
+          PY
+
+      - name: Validate ingestion configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/gj-k7-control/k7_ingest.py" \
+            --config "$RUNNER_TEMP/gj-k7-control/sources.json" \
+            --batch "$K7_BATCH" \
+            --validate-only
+
+      - name: Guard Drive credentials
+        shell: bash
+        env:
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$GDRIVE_CLIENT_ID" || -z "$GDRIVE_CLIENT_SECRET" || -z "$GDRIVE_REFRESH_TOKEN" ]]; then
+            echo "DRIVE_AUTH_BLOCKER=Missing GDRIVE_CLIENT_ID/GDRIVE_CLIENT_SECRET/GDRIVE_REFRESH_TOKEN"
+            exit 1
+          fi
+          echo "DRIVE_AUTH_SECRET_PRESENCE=PASS"
+
+      - name: Install pinned Drive client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --quiet \
+            google-api-python-client==2.179.0 \
+            google-auth==2.40.3 \
+            google-auth-httplib2==0.2.0
+
+      - name: Run generic fail-closed ingestion sequentially
+        id: ingest
+        shell: bash
+        env:
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/gj-k7-control/k7_ingest.py" \
+            --config "$RUNNER_TEMP/gj-k7-control/sources.json" \
+            --batch "$K7_BATCH"
+
+      - name: Preserve cloud-worker outputs for 7 days
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: GJ-K7-${{ env.K7_BATCH }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/gj-k7-artifacts/
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 7
+
+      - name: Final non-training guard
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "GENERIC_INGESTION_ENGINE=PASS"
+          echo "BATCH=$K7_BATCH"
+          echo "USER_PC_BYTES_USED=0"
+          echo "TRAINING_PERFORMED=NO"
+          echo "MODEL_WEIGHTS_MODIFIED=NO"
+          echo "NEXT_BATCH_STARTED=NO"
